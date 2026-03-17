@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+uvicorn
+pymongo
+dnspython
+python-dotenv
+slowapi
