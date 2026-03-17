@@ -1,7 +1,7 @@
 import os
 import re
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Security, Depends, Request # <-- Added Request
+from fastapi import FastAPI, HTTPException, Security, Depends, Request  # Added Request
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,6 +18,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 API_KEY = os.getenv("SECRET_API_KEY")
 API_KEY_NAME = "access_token"
 
+# Rate Limiter setup
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="PakData Secure API")
 app.state.limiter = limiter
@@ -35,7 +36,7 @@ class SearchRequest(BaseModel):
 async def get_api_key(header: str = Security(api_key_header)):
     if header == API_KEY:
         return header
-    raise HTTPException(status_code=403, detail="Unauthorized: Invalid Access Token")
+    raise HTTPException(status_code=403, detail="Unauthorized Access")
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 def normalize(raw: str):
@@ -57,11 +58,11 @@ def clean(res):
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 
-# NOTE: We add 'request: Request' to every route below
+# IMPORTANT: Every route now has 'request: Request' as the first argument
 @app.post("/search/personal", dependencies=[Depends(get_api_key)])
 @limiter.limit("20/minute")
-async def search_personal(request: Request, search_data: SearchRequest):
-    variants = get_number_variants(search_data.query)
+async def search_personal(request: Request, body: SearchRequest):
+    variants = get_number_variants(body.query)
     res = db_main["personal_data"].find_one({"mobile.digits": {"$in": variants}})
     if not res:
         raise HTTPException(status_code=404, detail="Personal record not found")
@@ -69,8 +70,8 @@ async def search_personal(request: Request, search_data: SearchRequest):
 
 @app.post("/search/number", dependencies=[Depends(get_api_key)])
 @limiter.limit("30/minute")
-async def search_number(request: Request, search_data: SearchRequest):
-    variants = get_number_variants(search_data.query)
+async def search_number(request: Request, body: SearchRequest):
+    variants = get_number_variants(body.query)
     int_variants = [int(v) for v in variants if v.isdigit()]
     
     targets = [
@@ -89,8 +90,8 @@ async def search_number(request: Request, search_data: SearchRequest):
 
 @app.post("/search/email", dependencies=[Depends(get_api_key)])
 @limiter.limit("30/minute")
-async def search_email(request: Request, search_data: SearchRequest):
-    q = search_data.query.strip()
+async def search_email(request: Request, body: SearchRequest):
+    q = body.query.strip()
     regex_query = re.compile(f"^{re.escape(q)}$", re.IGNORECASE)
     
     targets = [
@@ -108,5 +109,6 @@ async def search_email(request: Request, search_data: SearchRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    # Make sure we use the Render port
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
