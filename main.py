@@ -97,7 +97,8 @@ async def search_email(request: Request, body: SearchRequest):
     targets = [
         (db_main["address_records"], "email"),
         (db_pan["pan_records"], "email"),
-        (db_pan["pan_records"], "e")
+        (db_pan["pan_records"], "e"),
+        (db_main["users"], "email")
     ]
     
     for coll, field in targets:
