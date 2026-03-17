@@ -1,7 +1,7 @@
 import os
 import re
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi import FastAPI, HTTPException, Security, Depends, Request # <-- Added Request
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,7 +11,6 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-# Load environment variables
 load_dotenv()
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
@@ -19,21 +18,17 @@ MONGO_URI = os.getenv("MONGO_URI")
 API_KEY = os.getenv("SECRET_API_KEY")
 API_KEY_NAME = "access_token"
 
-# Rate Limiter setup (Prevents abuse)
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="PakData Secure API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Security Header
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-# Database Connection
 client = MongoClient(MONGO_URI)
 db_main = client["email_finder"]
 db_pan = client["pan_database"]
 
-# ── MODELS & SECURITY ─────────────────────────────────────────────────────────
 class SearchRequest(BaseModel):
     query: str
 
@@ -60,20 +55,13 @@ def clean(res):
     if res: res.pop("_id", None)
     return res
 
-# ── MIDDLEWARE ────────────────────────────────────────────────────────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # Change to your frontend URL for better security
-    allow_methods=["POST"],
-    allow_headers=["*"],
-)
-
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 
+# NOTE: We add 'request: Request' to every route below
 @app.post("/search/personal", dependencies=[Depends(get_api_key)])
 @limiter.limit("20/minute")
-async def search_personal(request: SearchRequest):
-    variants = get_number_variants(request.query)
+async def search_personal(request: Request, search_data: SearchRequest):
+    variants = get_number_variants(search_data.query)
     res = db_main["personal_data"].find_one({"mobile.digits": {"$in": variants}})
     if not res:
         raise HTTPException(status_code=404, detail="Personal record not found")
@@ -81,11 +69,10 @@ async def search_personal(request: SearchRequest):
 
 @app.post("/search/number", dependencies=[Depends(get_api_key)])
 @limiter.limit("30/minute")
-async def search_number(request: SearchRequest):
-    variants = get_number_variants(request.query)
+async def search_number(request: Request, search_data: SearchRequest):
+    variants = get_number_variants(search_data.query)
     int_variants = [int(v) for v in variants if v.isdigit()]
     
-    # Sequential search across all collections
     targets = [
         (db_main["address_records"], "number"),
         (db_pan["pan_records"], "number"),
@@ -98,12 +85,12 @@ async def search_number(request: SearchRequest):
         if res:
             return {"status": "success", "source": coll.name, "data": clean(res)}
             
-    raise HTTPException(status_code=404, detail="Number not found in any database")
+    raise HTTPException(status_code=404, detail="Number not found")
 
 @app.post("/search/email", dependencies=[Depends(get_api_key)])
 @limiter.limit("30/minute")
-async def search_email(request: SearchRequest):
-    q = request.query.strip()
+async def search_email(request: Request, search_data: SearchRequest):
+    q = search_data.query.strip()
     regex_query = re.compile(f"^{re.escape(q)}$", re.IGNORECASE)
     
     targets = [
@@ -121,4 +108,5 @@ async def search_email(request: SearchRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

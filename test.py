@@ -2,11 +2,11 @@ import requests
 
 
 
-url = "http://127.0.0.1:8000/search/number"
+url = "https://api-number.onrender.com/search/number"
 
 headers = {
 
-    "access_token": "MY_SECRET_PASSWORD_123",
+    "access_token": "ChooseAStrongPassword123",
 
     "Content-Type": "application/json"
 
