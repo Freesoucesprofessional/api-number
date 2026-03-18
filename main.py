@@ -1,9 +1,15 @@
 """
-Secure Lookup API — Dual MongoDB Edition
-==========================================
+Secure Lookup API — Dual MongoDB Edition + Key Management System
+=================================================================
 Two MongoDB clusters:
   MONGO_URL       → address, pan, personal, visits  (main cluster)
   MONGO_EMAIL_URL → email collection                (dedicated cluster)
+  MONGO_KEY_URL   → keys collection                 (key management cluster)
+
+Key Types:
+  - monthly   : valid for 1 month from activation
+  - yearly    : valid for 1 year from activation
+  - lifetime  : never expires
 
 Endpoints:
   GET  /search/number?q=<phone>     — address + pan + email (India)
@@ -13,22 +19,33 @@ Endpoints:
   GET  /visit                       — return current visitor count
   HEAD /health                      — uptime check (UptimeRobot)
   GET  /health                      — full status with collection counts
+
+  [Admin — requires X-Admin-Key header]
+  POST /admin/keys/generate         — generate one or more keys
+  GET  /admin/keys                  — list all keys (paginated)
+  DELETE /admin/keys/{key}          — revoke/delete a key
+
+  [User — requires X-API-Key header (the license key itself)]
+  GET  /key/info                    — check key status, expiry, usage
 """
 
 import re
 import os
+import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Query
+from fastapi import FastAPI, HTTPException, Depends, Request, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from dotenv import load_dotenv
-from pymongo import MongoClient
+from pymongo import MongoClient, ASCENDING
 from pymongo.collection import Collection
+from pydantic import BaseModel, Field
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -38,12 +55,17 @@ load_dotenv()
 
 MONGO_URL       = os.getenv("MONGO_URL", "")
 MONGO_EMAIL_URL = os.getenv("MONGO_EMAIL_URL", "")
+MONGO_KEY_URL   = os.getenv(
+    "MONGO_KEY_URL",
+    "mongodb+srv://telegrambotbydanger:siPJXsL56GQ03onP@cluster0.0om9qyw.mongodb.net/?appName=Cluster0"
+)
 DB_NAME         = os.getenv("DB_NAME", "pakdata")
+KEY_DB_NAME     = os.getenv("KEY_DB_NAME", "keystore")
 IMAGE_BASE      = os.getenv("IMAGE_BASE_URL", "https://pub-1c3225cdd2454dafa1768bf8b067d3a3.r2.dev").rstrip("/")
 
-VALID_API_KEYS: set[str] = set(
-    k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()
-)
+# Admin key to manage the key system (set this in your .env)
+ADMIN_KEY       = os.getenv("ADMIN_KEY", "change-this-admin-secret")
+
 RATE_LIMIT  = os.getenv("RATE_LIMIT", "10/minute")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
 
@@ -59,13 +81,13 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Lookup API", docs_url=None, redoc_url=None)
+app = FastAPI(title="Lookup API + Key System", docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "HEAD", "OPTIONS"],
     allow_headers=["*"],
     allow_credentials=False,
 )
@@ -76,6 +98,7 @@ app.add_middleware(
 
 _main_client:  MongoClient | None = None
 _email_client: MongoClient | None = None
+_key_client:   MongoClient | None = None
 
 
 def get_main_db():
@@ -98,6 +121,16 @@ def get_email_db():
     return _email_client[DB_NAME]
 
 
+def get_key_db():
+    global _key_client
+    if _key_client is None:
+        if not MONGO_KEY_URL:
+            raise RuntimeError("MONGO_KEY_URL is not set.")
+        _key_client = MongoClient(MONGO_KEY_URL, serverSelectionTimeoutMS=5000)
+        logger.info("✓ Key MongoDB client initialized")
+    return _key_client[KEY_DB_NAME]
+
+
 def get_col(name: str) -> Collection:
     """Route collection to correct cluster."""
     if name == "email":
@@ -105,8 +138,13 @@ def get_col(name: str) -> Collection:
     return get_main_db()[name]
 
 
+def get_keys_col() -> Collection:
+    return get_key_db()["keys"]
+
+
 @app.on_event("startup")
 async def startup():
+    # Main cluster
     try:
         db = get_main_db()
         db.command("ping")
@@ -117,6 +155,7 @@ async def startup():
     except Exception as e:
         logger.error("✗ Main cluster failed: %s", e)
 
+    # Email cluster
     try:
         db = get_email_db()
         db.command("ping")
@@ -126,24 +165,104 @@ async def startup():
     except Exception as e:
         logger.error("✗ Email cluster failed: %s", e)
 
+    # Key cluster
+    try:
+        db = get_key_db()
+        db.command("ping")
+        col = db["keys"]
+        # Ensure unique index on "key" field
+        col.create_index([("key", ASCENDING)], unique=True)
+        count = col.count_documents({})
+        logger.info("✓ Key cluster connected — %s keys stored", count)
+    except Exception as e:
+        logger.error("✗ Key cluster failed: %s", e)
+
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _main_client, _email_client
-    for client in [_main_client, _email_client]:
+    global _main_client, _email_client, _key_client
+    for client in [_main_client, _email_client, _key_client]:
         if client:
             client.close()
     logger.info("MongoDB clients closed.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Security
+# Key helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def verify_api_key(request: Request) -> str:
-    key = request.headers.get("X-API-Key", "")
-    if not VALID_API_KEYS or key not in VALID_API_KEYS:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+KeyType = Literal["monthly", "yearly", "lifetime"]
+
+KEY_DURATIONS: dict[str, Optional[timedelta]] = {
+    "monthly":  timedelta(days=30),
+    "yearly":   timedelta(days=365),
+    "lifetime": None,
+}
+
+
+def generate_key() -> str:
+    """Generate a readable API key: XXXX-XXXX-XXXX-XXXX"""
+    raw = uuid.uuid4().hex.upper()
+    return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}-{raw[12:16]}"
+
+
+def compute_expiry(key_type: KeyType) -> Optional[str]:
+    delta = KEY_DURATIONS[key_type]
+    if delta is None:
+        return None  # lifetime
+    return (datetime.now(timezone.utc) + delta).isoformat()
+
+
+def is_key_valid(doc: dict) -> bool:
+    """Check if a key document is active and not expired."""
+    if doc.get("revoked"):
+        return False
+    expiry = doc.get("expires_at")
+    if expiry is None:
+        return True  # lifetime
+    return datetime.now(timezone.utc) < datetime.fromisoformat(expiry)
+
+
+def resolve_key(raw_key: str) -> dict:
+    """
+    Fetch key doc from MongoDB. Raises 401 if missing/revoked/expired.
+    Increments usage count on each successful call.
+    """
+    col = get_keys_col()
+    doc = col.find_one({"key": raw_key})
+    if not doc:
+        raise HTTPException(status_code=401, detail="Invalid API key.")
+    if doc.get("revoked"):
+        raise HTTPException(status_code=401, detail="API key has been revoked.")
+    expiry = doc.get("expires_at")
+    if expiry and datetime.now(timezone.utc) >= datetime.fromisoformat(expiry):
+        raise HTTPException(status_code=401, detail="API key has expired.")
+    # Bump usage counter + last_used
+    col.update_one(
+        {"key": raw_key},
+        {
+            "$inc": {"usage_count": 1},
+            "$set": {"last_used": datetime.now(timezone.utc).isoformat()},
+        },
+    )
+    return doc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Security — Admin
+# ─────────────────────────────────────────────────────────────────────────────
+
+def verify_admin(request: Request):
+    key = request.headers.get("X-Admin-Key", "")
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin key.")
     return key
+
+
+def verify_api_key(request: Request) -> dict:
+    """Validate the user's license key (X-API-Key header)."""
+    raw = request.headers.get("X-API-Key", "")
+    if not raw:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key header.")
+    return resolve_key(raw)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Validation
@@ -231,7 +350,7 @@ def phone_filter_pak(number: str) -> dict:
     return {"mobile.digits": {"$regex": f"{short}$"}}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Search Endpoints
+# Search Endpoints  (now use license key, not static API_KEYS env var)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/search/number")
@@ -239,7 +358,7 @@ def phone_filter_pak(number: str) -> dict:
 async def search_by_number(
     request: Request,
     q: str = Query(..., min_length=10, max_length=12, description="10 or 12 digit phone number"),
-    _key: str = Depends(verify_api_key),
+    _key_doc: dict = Depends(verify_api_key),
 ):
     number       = validate_phone(q)
     filt         = phone_filter(number)
@@ -261,7 +380,7 @@ async def search_by_number(
 async def search_by_email(
     request: Request,
     q: str = Query(..., min_length=6, max_length=254, description="Valid email address"),
-    _key: str = Depends(verify_api_key),
+    _key_doc: dict = Depends(verify_api_key),
 ):
     email        = validate_email(q)
     filt         = {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
@@ -283,7 +402,7 @@ async def search_by_email(
 async def search_pak_by_number(
     request: Request,
     q: str = Query(..., min_length=10, max_length=12, description="10 or 12 digit Pakistani mobile"),
-    _key: str = Depends(verify_api_key),
+    _key_doc: dict = Depends(verify_api_key),
 ):
     number = validate_phone(q)
     filt   = phone_filter_pak(number)
@@ -296,12 +415,195 @@ async def search_pak_by_number(
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Key Info Endpoint (user checks their own key)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/key/info")
+async def key_info(request: Request, key_doc: dict = Depends(verify_api_key)):
+    """Return info about the current key (expiry, type, usage)."""
+    expiry = key_doc.get("expires_at")
+    now    = datetime.now(timezone.utc)
+
+    if expiry:
+        exp_dt      = datetime.fromisoformat(expiry)
+        days_left   = max(0, (exp_dt - now).days)
+        expires_str = exp_dt.strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        days_left   = None
+        expires_str = "Never (lifetime)"
+
+    return {
+        "key":         key_doc["key"],
+        "type":        key_doc.get("type", "unknown"),
+        "label":       key_doc.get("label", ""),
+        "active":      True,
+        "expires_at":  expires_str,
+        "days_left":   days_left,
+        "usage_count": key_doc.get("usage_count", 0),
+        "last_used":   key_doc.get("last_used", "never"),
+        "created_at":  key_doc.get("created_at", ""),
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin — Key Management
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GenerateKeyRequest(BaseModel):
+    type:  KeyType = Field(..., description="monthly | yearly | lifetime")
+    count: int     = Field(1, ge=1, le=100, description="How many keys to generate")
+    label: str     = Field("", description="Optional label/note for this batch")
+
+
+@app.post("/admin/keys/generate")
+async def admin_generate_keys(
+    request: Request,
+    body: GenerateKeyRequest,
+    _admin: str = Depends(verify_admin),
+):
+    """
+    Generate one or more license keys.
+    Requires X-Admin-Key header.
+
+    Body:
+      {
+        "type":  "monthly" | "yearly" | "lifetime",
+        "count": 1,
+        "label": "optional note"
+      }
+    """
+    col  = get_keys_col()
+    now  = datetime.now(timezone.utc).isoformat()
+    keys = []
+
+    for _ in range(body.count):
+        new_key = generate_key()
+        doc = {
+            "key":         new_key,
+            "type":        body.type,
+            "label":       body.label,
+            "expires_at":  compute_expiry(body.type),
+            "revoked":     False,
+            "usage_count": 0,
+            "last_used":   None,
+            "created_at":  now,
+        }
+        col.insert_one(doc)
+        doc.pop("_id", None)
+        keys.append(doc)
+
+    return {
+        "generated": len(keys),
+        "type":      body.type,
+        "keys":      keys,
+    }
+
+
+@app.get("/admin/keys")
+async def admin_list_keys(
+    request: Request,
+    page:     int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    type:     Optional[str] = Query(None, description="Filter by type"),
+    revoked:  Optional[bool] = Query(None, description="Filter by revoked status"),
+    _admin:   str = Depends(verify_admin),
+):
+    """
+    List all keys (paginated).
+    Requires X-Admin-Key header.
+    """
+    col    = get_keys_col()
+    filt: dict = {}
+    if type:
+        filt["type"] = type
+    if revoked is not None:
+        filt["revoked"] = revoked
+
+    total  = col.count_documents(filt)
+    skip   = (page - 1) * per_page
+    cursor = col.find(filt).sort("created_at", -1).skip(skip).limit(per_page)
+
+    keys = []
+    now  = datetime.now(timezone.utc)
+    for doc in cursor:
+        doc.pop("_id", None)
+        expiry = doc.get("expires_at")
+        if expiry:
+            exp_dt       = datetime.fromisoformat(expiry)
+            doc["status"] = "expired" if now >= exp_dt else "active"
+            doc["days_left"] = max(0, (exp_dt - now).days)
+        else:
+            doc["status"]    = "revoked" if doc.get("revoked") else "lifetime"
+            doc["days_left"] = None
+        keys.append(doc)
+
+    return {
+        "total":    total,
+        "page":     page,
+        "per_page": per_page,
+        "pages":    (total + per_page - 1) // per_page,
+        "keys":     keys,
+    }
+
+
+@app.delete("/admin/keys/{key_value}")
+async def admin_revoke_key(
+    request:   Request,
+    key_value: str,
+    _admin:    str = Depends(verify_admin),
+):
+    """
+    Revoke a key by value (marks as revoked, does NOT delete).
+    Requires X-Admin-Key header.
+    """
+    col    = get_keys_col()
+    result = col.update_one(
+        {"key": key_value},
+        {"$set": {"revoked": True, "revoked_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+    return {"revoked": True, "key": key_value}
+
+
+@app.delete("/admin/keys/{key_value}/hard")
+async def admin_delete_key(
+    request:   Request,
+    key_value: str,
+    _admin:    str = Depends(verify_admin),
+):
+    """
+    Permanently delete a key from the database.
+    Requires X-Admin-Key header.
+    """
+    col    = get_keys_col()
+    result = col.delete_one({"key": key_value})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+    return {"deleted": True, "key": key_value}
+
+
+@app.post("/admin/keys/{key_value}/unrevoke")
+async def admin_unrevoke_key(
+    request:   Request,
+    key_value: str,
+    _admin:    str = Depends(verify_admin),
+):
+    """Re-activate a previously revoked key."""
+    col    = get_keys_col()
+    result = col.update_one(
+        {"key": key_value},
+        {"$set": {"revoked": False}, "$unset": {"revoked_at": ""}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+    return {"unrevoked": True, "key": key_value}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Visitor Counter
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/visit")
 async def record_visit(request: Request):
-    """Increment visitor count on each page load. No auth required."""
     try:
         visits = get_main_db()["visits"]
         visits.update_one(
@@ -321,7 +623,6 @@ async def record_visit(request: Request):
 
 @app.get("/visit")
 async def get_visits():
-    """Return current total visitor count. No auth required."""
     try:
         doc = get_main_db()["visits"].find_one({"_id": "global_counter"})
         return {"total": doc["total"] if doc else 0}
@@ -335,17 +636,17 @@ async def get_visits():
 
 @app.head("/health")
 async def health_head():
-    """HEAD method for UptimeRobot ping — no body returned."""
     return JSONResponse(content=None, status_code=200)
 
 
 @app.get("/health")
 async def health():
-    """Full status with live collection counts."""
     try:
         main_db  = get_main_db()
         email_db = get_email_db()
+        key_db   = get_key_db()
         visits   = main_db["visits"].find_one({"_id": "global_counter"})
+        key_col  = key_db["keys"]
         return {
             "status": "ok",
             "main_cluster": {
@@ -354,6 +655,14 @@ async def health():
             },
             "email_cluster": {
                 "email": email_db["email"].count_documents({})
+            },
+            "key_system": {
+                "total_keys":    key_col.count_documents({}),
+                "active_keys":   key_col.count_documents({"revoked": False}),
+                "revoked_keys":  key_col.count_documents({"revoked": True}),
+                "monthly_keys":  key_col.count_documents({"type": "monthly"}),
+                "yearly_keys":   key_col.count_documents({"type": "yearly"}),
+                "lifetime_keys": key_col.count_documents({"type": "lifetime"}),
             },
             "visitors": visits["total"] if visits else 0,
         }
