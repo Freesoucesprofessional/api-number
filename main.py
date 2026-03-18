@@ -296,6 +296,46 @@ async def search_pak_by_number(
         "results": safe_personal(docs),
     }
 
+@app.post("/visit")
+async def record_visit(request: Request):
+    """
+    Called once per page load from the frontend.
+    Increments total visitor count and stores visit metadata.
+    No auth required — public endpoint.
+    """
+    try:
+        db = get_main_db()
+        col = db["visits"]
+ 
+        # Upsert a single counter document
+        col.update_one(
+            {"_id": "global_counter"},
+            {
+                "$inc": {"total": 1},
+                "$set": {"last_visit": datetime.now(timezone.utc).isoformat()},
+            },
+            upsert=True,
+        )
+ 
+        # Get updated count
+        doc = col.find_one({"_id": "global_counter"})
+        return {"total": doc["total"] if doc else 1}
+ 
+    except Exception as e:
+        logger.error("Visit counter error: %s", e)
+        return {"total": 0}
+ 
+ 
+@app.get("/visit")
+async def get_visits():
+    """Get current total visitor count. No auth required."""
+    try:
+        db  = get_main_db()
+        doc = db["visits"].find_one({"_id": "global_counter"})
+        return {"total": doc["total"] if doc else 0}
+    except Exception as e:
+        logger.error("Get visits error: %s", e)
+        return {"total": 0}
 
 @app.get("/health")
 async def health():
