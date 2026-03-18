@@ -34,6 +34,7 @@ import os
 import uuid
 import logging
 import time
+import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Literal, Optional
@@ -48,6 +49,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 from pymongo.collection import Collection
 from pydantic import BaseModel, Field
+import httpx
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -180,12 +182,33 @@ async def startup():
         db = get_key_db()
         db.command("ping")
         col = db["keys"]
-        # Ensure unique index on "key" field
         col.create_index([("key", ASCENDING)], unique=True)
         count = col.count_documents({})
         logger.info("✓ Key cluster connected — %s keys stored", count)
     except Exception as e:
         logger.error("✗ Key cluster failed: %s", e)
+
+    # Self-ping keep-alive (prevents Render free tier cold starts)
+    asyncio.create_task(_keep_alive())
+
+
+_keep_alive_task = None
+
+async def _keep_alive():
+    """Ping own /health every 4 minutes so Render never spins down."""
+    own_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not own_url:
+        logger.info("⚠ RENDER_EXTERNAL_URL not set — keep-alive disabled")
+        return
+    await asyncio.sleep(60)  # wait 1 min after boot before first ping
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            try:
+                r = await client.get(f"{own_url}/health")
+                logger.info("♥ keep-alive ping → %s", r.status_code)
+            except Exception as e:
+                logger.warning("♥ keep-alive failed: %s", e)
+            await asyncio.sleep(240)  # ping every 4 minutes
 
 
 @app.on_event("shutdown")
