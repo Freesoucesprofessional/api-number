@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: pakdata-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: API_KEYS
+        sync: false          # set manually in Render dashboard
+      - key: RATE_LIMIT
+        value: 10/minute
+      - key: ADDRESS_DATA_URL
+        sync: false
+      - key: PAN_DATA_URL
+        sync: false
+      - key: PERSONAL_DATA_URL
+        sync: false
+      - key: EMAIL_DATA_URL
+        sync: false
+      - key: IMAGE_BASE_URL
+        sync: false
