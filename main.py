@@ -33,6 +33,8 @@ import re
 import os
 import uuid
 import logging
+import time
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Literal, Optional
 
@@ -68,6 +70,14 @@ ADMIN_KEY       = os.getenv("ADMIN_KEY", "change-this-admin-secret")
 
 RATE_LIMIT  = os.getenv("RATE_LIMIT", "10/minute")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
+
+# Brute-force protection settings
+ADMIN_MAX_ATTEMPTS  = int(os.getenv("ADMIN_MAX_ATTEMPTS", "5"))    # max wrong tries
+ADMIN_LOCKOUT_SECS  = int(os.getenv("ADMIN_LOCKOUT_SECS", "300"))  # 5 min lockout
+ADMIN_ATTEMPT_WINDOW= int(os.getenv("ADMIN_ATTEMPT_WINDOW","60"))  # count attempts within 60s
+
+# In-memory store: ip -> list of failed attempt timestamps
+_admin_fail_log: dict[str, list[float]] = defaultdict(list)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -247,13 +257,49 @@ def resolve_key(raw_key: str) -> dict:
     return doc
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Security — Admin
+# Security — Admin  (brute-force protected)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _get_ip(request: Request) -> str:
+    """Best-effort real IP (works behind proxies)."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def verify_admin(request: Request):
+    ip  = _get_ip(request)
+    now = time.time()
+
+    # Purge old entries outside the attempt window
+    _admin_fail_log[ip] = [
+        t for t in _admin_fail_log[ip]
+        if now - t < ADMIN_LOCKOUT_SECS
+    ]
+
+    # Check if IP is locked out
+    recent = [t for t in _admin_fail_log[ip] if now - t < ADMIN_LOCKOUT_SECS]
+    if len(recent) >= ADMIN_MAX_ATTEMPTS:
+        wait = int(ADMIN_LOCKOUT_SECS - (now - recent[0]))
+        logger.warning("Admin brute-force lockout for IP %s (%ds remaining)", ip, wait)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {wait} seconds.",
+        )
+
     key = request.headers.get("X-Admin-Key", "")
     if key != ADMIN_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing admin key.")
+        _admin_fail_log[ip].append(now)
+        attempts_left = ADMIN_MAX_ATTEMPTS - len(_admin_fail_log[ip])
+        logger.warning("Failed admin auth from IP %s (%d attempts left)", ip, attempts_left)
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid admin key. {max(0, attempts_left)} attempt(s) remaining before lockout.",
+        )
+
+    # Successful auth — clear fail log for this IP
+    _admin_fail_log[ip] = []
     return key
 
 
@@ -455,6 +501,7 @@ class GenerateKeyRequest(BaseModel):
 
 
 @app.post("/admin/keys/generate")
+@limiter.limit("10/minute")
 async def admin_generate_keys(
     request: Request,
     body: GenerateKeyRequest,
@@ -499,6 +546,7 @@ async def admin_generate_keys(
 
 
 @app.get("/admin/keys")
+@limiter.limit("10/minute")
 async def admin_list_keys(
     request: Request,
     page:     int = Query(1, ge=1),
@@ -546,6 +594,7 @@ async def admin_list_keys(
 
 
 @app.delete("/admin/keys/{key_value}")
+@limiter.limit("10/minute")
 async def admin_revoke_key(
     request:   Request,
     key_value: str,
@@ -566,6 +615,7 @@ async def admin_revoke_key(
 
 
 @app.delete("/admin/keys/{key_value}/hard")
+@limiter.limit("10/minute")
 async def admin_delete_key(
     request:   Request,
     key_value: str,
@@ -583,6 +633,7 @@ async def admin_delete_key(
 
 
 @app.post("/admin/keys/{key_value}/unrevoke")
+@limiter.limit("10/minute")
 async def admin_unrevoke_key(
     request:   Request,
     key_value: str,
