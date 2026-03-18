@@ -2,22 +2,27 @@
 Secure Lookup API — Dual MongoDB Edition
 ==========================================
 Two MongoDB clusters:
-  MONGO_URL       → address, pan, personal  (main cluster)
-  MONGO_EMAIL_URL → email collection        (dedicated cluster)
+  MONGO_URL       → address, pan, personal, visits  (main cluster)
+  MONGO_EMAIL_URL → email collection                (dedicated cluster)
 
 Endpoints:
-  GET /search/number?q=<phone>      — address + pan + email (India)
-  GET /search/email?q=<email>       — address + pan + email (India)
-  GET /search/pak/number?q=<phone>  — personal (Pakistan) with images
-  GET /health                       — status check, no auth required
+  GET  /search/number?q=<phone>     — address + pan + email (India)
+  GET  /search/email?q=<email>      — address + pan + email (India)
+  GET  /search/pak/number?q=<phone> — personal (Pakistan) with images
+  POST /visit                       — increment + return visitor count
+  GET  /visit                       — return current visitor count
+  HEAD /health                      — uptime check (UptimeRobot)
+  GET  /health                      — full status with collection counts
 """
 
 import re
 import os
 import logging
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -31,10 +36,10 @@ from pymongo.collection import Collection
 
 load_dotenv()
 
-MONGO_URL       = os.getenv("MONGO_URL", "")        # main cluster: address, pan, personal
-MONGO_EMAIL_URL = os.getenv("MONGO_EMAIL_URL", "")  # email cluster: email collection
-DB_NAME         = os.getenv("DB_NAME")
-IMAGE_BASE      = os.getenv("IMAGE_BASE_URL").rstrip("/")
+MONGO_URL       = os.getenv("MONGO_URL", "")
+MONGO_EMAIL_URL = os.getenv("MONGO_EMAIL_URL", "")
+DB_NAME         = os.getenv("DB_NAME", "pakdata")
+IMAGE_BASE      = os.getenv("IMAGE_BASE_URL", "https://pub-1c3225cdd2454dafa1768bf8b067d3a3.r2.dev").rstrip("/")
 
 VALID_API_KEYS: set[str] = set(
     k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()
@@ -60,12 +65,13 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MongoDB clients — main (address/pan/personal) + email cluster
+# MongoDB clients
 # ─────────────────────────────────────────────────────────────────────────────
 
 _main_client:  MongoClient | None = None
@@ -92,7 +98,7 @@ def get_email_db():
     return _email_client[DB_NAME]
 
 
-def col(name: str) -> Collection:
+def get_col(name: str) -> Collection:
     """Route collection to correct cluster."""
     if name == "email":
         return get_email_db()[name]
@@ -101,7 +107,6 @@ def col(name: str) -> Collection:
 
 @app.on_event("startup")
 async def startup():
-    # Main cluster — address, pan, personal
     try:
         db = get_main_db()
         db.command("ping")
@@ -112,7 +117,6 @@ async def startup():
     except Exception as e:
         logger.error("✗ Main cluster failed: %s", e)
 
-    # Email cluster
     try:
         db = get_email_db()
         db.command("ping")
@@ -195,7 +199,7 @@ def safe_address(docs):
 def safe_pan(docs):
     return [{k: v for k, v in strip_id(d).items() if k in PAN_FIELDS} for d in docs]
 
-def safe_email(docs):
+def safe_email_docs(docs):
     return [{k: v for k, v in strip_id(d).items() if k in EMAIL_FIELDS} for d in docs]
 
 def build_image_url(filename) -> str | None:
@@ -227,7 +231,7 @@ def phone_filter_pak(number: str) -> dict:
     return {"mobile.digits": {"$regex": f"{short}$"}}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Endpoints
+# Search Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/search/number")
@@ -237,20 +241,18 @@ async def search_by_number(
     q: str = Query(..., min_length=10, max_length=12, description="10 or 12 digit phone number"),
     _key: str = Depends(verify_api_key),
 ):
-    """Search address + pan (main cluster) + email (email cluster) by phone."""
-    number = validate_phone(q)
-    filt   = phone_filter(number)
-
-    address_docs = list(col("address").find(filt, limit=MAX_RESULTS))
-    pan_docs     = list(col("pan").find(filt,     limit=MAX_RESULTS))
-    email_docs   = list(col("email").find(filt,   limit=MAX_RESULTS))
+    number       = validate_phone(q)
+    filt         = phone_filter(number)
+    address_docs = list(get_col("address").find(filt, limit=MAX_RESULTS))
+    pan_docs     = list(get_col("pan").find(filt,     limit=MAX_RESULTS))
+    email_docs   = list(get_col("email").find(filt,   limit=MAX_RESULTS))
 
     return {
         "query": number,
         "total": len(address_docs) + len(pan_docs) + len(email_docs),
         "address": {"count": len(address_docs), "results": safe_address(address_docs)},
         "pan":     {"count": len(pan_docs),     "results": safe_pan(pan_docs)},
-        "email":   {"count": len(email_docs),   "results": safe_email(email_docs)},
+        "email":   {"count": len(email_docs),   "results": safe_email_docs(email_docs)},
     }
 
 
@@ -261,20 +263,18 @@ async def search_by_email(
     q: str = Query(..., min_length=6, max_length=254, description="Valid email address"),
     _key: str = Depends(verify_api_key),
 ):
-    """Search address + pan (main cluster) + email (email cluster) by email."""
-    email = validate_email(q)
-    filt  = {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
-
-    address_docs = list(col("address").find(filt, limit=MAX_RESULTS))
-    pan_docs     = list(col("pan").find(filt,     limit=MAX_RESULTS))
-    email_docs   = list(col("email").find(filt,   limit=MAX_RESULTS))
+    email        = validate_email(q)
+    filt         = {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
+    address_docs = list(get_col("address").find(filt, limit=MAX_RESULTS))
+    pan_docs     = list(get_col("pan").find(filt,     limit=MAX_RESULTS))
+    email_docs   = list(get_col("email").find(filt,   limit=MAX_RESULTS))
 
     return {
         "query": email,
         "total": len(address_docs) + len(pan_docs) + len(email_docs),
         "address": {"count": len(address_docs), "results": safe_address(address_docs)},
         "pan":     {"count": len(pan_docs),     "results": safe_pan(pan_docs)},
-        "email":   {"count": len(email_docs),   "results": safe_email(email_docs)},
+        "email":   {"count": len(email_docs),   "results": safe_email_docs(email_docs)},
     }
 
 
@@ -285,10 +285,9 @@ async def search_pak_by_number(
     q: str = Query(..., min_length=10, max_length=12, description="10 or 12 digit Pakistani mobile"),
     _key: str = Depends(verify_api_key),
 ):
-    """Search personal collection (main cluster) by Pakistani mobile number."""
     number = validate_phone(q)
     filt   = phone_filter_pak(number)
-    docs   = list(col("personal").find(filt, limit=MAX_RESULTS))
+    docs   = list(get_col("personal").find(filt, limit=MAX_RESULTS))
 
     return {
         "query":   number,
@@ -296,19 +295,16 @@ async def search_pak_by_number(
         "results": safe_personal(docs),
     }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Visitor Counter
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.post("/visit")
 async def record_visit(request: Request):
-    """
-    Called once per page load from the frontend.
-    Increments total visitor count and stores visit metadata.
-    No auth required — public endpoint.
-    """
+    """Increment visitor count on each page load. No auth required."""
     try:
-        db = get_main_db()
-        col = db["visits"]
- 
-        # Upsert a single counter document
-        col.update_one(
+        visits = get_main_db()["visits"]
+        visits.update_one(
             {"_id": "global_counter"},
             {
                 "$inc": {"total": 1},
@@ -316,32 +312,40 @@ async def record_visit(request: Request):
             },
             upsert=True,
         )
- 
-        # Get updated count
-        doc = col.find_one({"_id": "global_counter"})
+        doc = visits.find_one({"_id": "global_counter"})
         return {"total": doc["total"] if doc else 1}
- 
     except Exception as e:
         logger.error("Visit counter error: %s", e)
         return {"total": 0}
- 
- 
+
+
 @app.get("/visit")
 async def get_visits():
-    """Get current total visitor count. No auth required."""
+    """Return current total visitor count. No auth required."""
     try:
-        db  = get_main_db()
-        doc = db["visits"].find_one({"_id": "global_counter"})
+        doc = get_main_db()["visits"].find_one({"_id": "global_counter"})
         return {"total": doc["total"] if doc else 0}
     except Exception as e:
         logger.error("Get visits error: %s", e)
         return {"total": 0}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Health Check
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.head("/health")
+async def health_head():
+    """HEAD method for UptimeRobot ping — no body returned."""
+    return JSONResponse(content=None, status_code=200)
+
+
 @app.get("/health")
 async def health():
+    """Full status with live collection counts."""
     try:
         main_db  = get_main_db()
         email_db = get_email_db()
+        visits   = main_db["visits"].find_one({"_id": "global_counter"})
         return {
             "status": "ok",
             "main_cluster": {
@@ -351,6 +355,7 @@ async def health():
             "email_cluster": {
                 "email": email_db["email"].count_documents({})
             },
+            "visitors": visits["total"] if visits else 0,
         }
     except Exception as e:
         return {"status": "error", "detail": str(e)}
