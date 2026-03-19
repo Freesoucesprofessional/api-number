@@ -21,12 +21,13 @@ Endpoints:
   GET  /health                      — full status with collection counts
 
   [Admin — requires X-Admin-Key header]
-  POST  /admin/keys/generate              — generate one or more keys
-  GET   /admin/keys                       — list all keys (paginated)
-  DELETE /admin/keys/{key}               — revoke/delete a key
-  DELETE /admin/keys/{key}/hard          — permanently delete a key
-  POST  /admin/keys/{key}/unrevoke       — restore a revoked key
-  PATCH /admin/keys/{key}/label          — update label/note on a key  ← NEW
+  POST   /admin/keys/generate           — generate keys (NULL-TRACE-API-XXXXXXXX)
+  GET    /admin/keys                    — list all keys (paginated)
+  DELETE /admin/keys/{key}              — revoke a key
+  DELETE /admin/keys/{key}/hard         — permanently delete a key
+  POST   /admin/keys/{key}/unrevoke     — restore a revoked key
+  PATCH  /admin/keys/{key}/label        — update label/note
+  PATCH  /admin/keys/{key}/value        — change the key string itself  ← NEW
 
   [User — requires X-API-Key header (the license key itself)]
   GET  /key/info                    — check key status, expiry, usage
@@ -42,7 +43,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Query, Body
+from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -51,7 +52,7 @@ from slowapi.errors import RateLimitExceeded
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 from pymongo.collection import Collection
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import httpx
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -70,19 +71,19 @@ DB_NAME         = os.getenv("DB_NAME", "pakdata")
 KEY_DB_NAME     = os.getenv("KEY_DB_NAME", "keystore")
 IMAGE_BASE      = os.getenv("IMAGE_BASE_URL", "https://pub-1c3225cdd2454dafa1768bf8b067d3a3.r2.dev").rstrip("/")
 
-# Admin key to manage the key system (set this in your .env)
 ADMIN_KEY       = os.getenv("ADMIN_KEY", "change-this-admin-secret")
 
 RATE_LIMIT  = os.getenv("RATE_LIMIT", "10/minute")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
 
-# Brute-force protection settings
-ADMIN_MAX_ATTEMPTS  = int(os.getenv("ADMIN_MAX_ATTEMPTS", "5"))    # max wrong tries
-ADMIN_LOCKOUT_SECS  = int(os.getenv("ADMIN_LOCKOUT_SECS", "300"))  # 5 min lockout
-ADMIN_ATTEMPT_WINDOW= int(os.getenv("ADMIN_ATTEMPT_WINDOW","60"))  # count attempts within 60s
+ADMIN_MAX_ATTEMPTS   = int(os.getenv("ADMIN_MAX_ATTEMPTS", "5"))
+ADMIN_LOCKOUT_SECS   = int(os.getenv("ADMIN_LOCKOUT_SECS", "300"))
+ADMIN_ATTEMPT_WINDOW = int(os.getenv("ADMIN_ATTEMPT_WINDOW", "60"))
 
-# In-memory store: ip -> list of failed attempt timestamps
 _admin_fail_log: dict[str, list[float]] = defaultdict(list)
+
+# Key format: NULL-TRACE-API-XXXXXXXX  (8 uppercase hex chars)
+KEY_FORMAT_REGEX = re.compile(r"^NULL-TRACE-API-[0-9A-F]{8}$")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -147,7 +148,6 @@ def get_key_db():
 
 
 def get_col(name: str) -> Collection:
-    """Route collection to correct cluster."""
     if name == "email":
         return get_email_db()[name]
     return get_main_db()[name]
@@ -159,7 +159,6 @@ def get_keys_col() -> Collection:
 
 @app.on_event("startup")
 async def startup():
-    # Main cluster
     try:
         db = get_main_db()
         db.command("ping")
@@ -170,7 +169,6 @@ async def startup():
     except Exception as e:
         logger.error("✗ Main cluster failed: %s", e)
 
-    # Email cluster
     try:
         db = get_email_db()
         db.command("ping")
@@ -180,7 +178,6 @@ async def startup():
     except Exception as e:
         logger.error("✗ Email cluster failed: %s", e)
 
-    # Key cluster
     try:
         db = get_key_db()
         db.command("ping")
@@ -191,19 +188,18 @@ async def startup():
     except Exception as e:
         logger.error("✗ Key cluster failed: %s", e)
 
-    # Self-ping keep-alive (prevents Render free tier cold starts)
     asyncio.create_task(_keep_alive())
 
 
 _keep_alive_task = None
 
+
 async def _keep_alive():
-    """Ping own /health every 4 minutes so Render never spins down."""
     own_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not own_url:
         logger.info("⚠ RENDER_EXTERNAL_URL not set — keep-alive disabled")
         return
-    await asyncio.sleep(60)  # wait 1 min after boot before first ping
+    await asyncio.sleep(60)
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
             try:
@@ -211,7 +207,7 @@ async def _keep_alive():
                 logger.info("♥ keep-alive ping → %s", r.status_code)
             except Exception as e:
                 logger.warning("♥ keep-alive failed: %s", e)
-            await asyncio.sleep(240)  # ping every 4 minutes
+            await asyncio.sleep(240)
 
 
 @app.on_event("shutdown")
@@ -236,33 +232,42 @@ KEY_DURATIONS: dict[str, Optional[timedelta]] = {
 
 
 def generate_key() -> str:
-    """Generate a readable API key: XXXX-XXXX-XXXX-XXXX"""
-    raw = uuid.uuid4().hex.upper()
-    return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}-{raw[12:16]}"
+    """
+    Generate a key in the format: NULL-TRACE-API-XXXXXXXX
+    where XXXXXXXX is 8 random uppercase hex characters.
+    Example: NULL-TRACE-API-A3F9B21C
+    """
+    hash_part = uuid.uuid4().hex[:8].upper()
+    return f"NULL-TRACE-API-{hash_part}"
+
+
+def _unique_key(col: Collection) -> str:
+    """Keep regenerating until we get a value not already in the collection."""
+    for _ in range(10):
+        candidate = generate_key()
+        if not col.find_one({"key": candidate}):
+            return candidate
+    # Astronomically unlikely to reach here, but be safe
+    return f"NULL-TRACE-API-{uuid.uuid4().hex[:8].upper()}"
 
 
 def compute_expiry(key_type: KeyType) -> Optional[str]:
     delta = KEY_DURATIONS[key_type]
     if delta is None:
-        return None  # lifetime
+        return None
     return (datetime.now(timezone.utc) + delta).isoformat()
 
 
 def is_key_valid(doc: dict) -> bool:
-    """Check if a key document is active and not expired."""
     if doc.get("revoked"):
         return False
     expiry = doc.get("expires_at")
     if expiry is None:
-        return True  # lifetime
+        return True
     return datetime.now(timezone.utc) < datetime.fromisoformat(expiry)
 
 
 def resolve_key(raw_key: str) -> dict:
-    """
-    Fetch key doc from MongoDB. Raises 401 if missing/revoked/expired.
-    Increments usage count on each successful call.
-    """
     col = get_keys_col()
     doc = col.find_one({"key": raw_key})
     if not doc:
@@ -272,7 +277,6 @@ def resolve_key(raw_key: str) -> dict:
     expiry = doc.get("expires_at")
     if expiry and datetime.now(timezone.utc) >= datetime.fromisoformat(expiry):
         raise HTTPException(status_code=401, detail="API key has expired.")
-    # Bump usage counter + last_used
     col.update_one(
         {"key": raw_key},
         {
@@ -283,11 +287,10 @@ def resolve_key(raw_key: str) -> dict:
     return doc
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Security — Admin  (brute-force protected)
+# Security — Admin (brute-force protected)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_ip(request: Request) -> str:
-    """Best-effort real IP (works behind proxies)."""
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -298,13 +301,11 @@ def verify_admin(request: Request):
     ip  = _get_ip(request)
     now = time.time()
 
-    # Purge old entries outside the attempt window
     _admin_fail_log[ip] = [
         t for t in _admin_fail_log[ip]
         if now - t < ADMIN_LOCKOUT_SECS
     ]
 
-    # Check if IP is locked out
     recent = [t for t in _admin_fail_log[ip] if now - t < ADMIN_LOCKOUT_SECS]
     if len(recent) >= ADMIN_MAX_ATTEMPTS:
         wait = int(ADMIN_LOCKOUT_SECS - (now - recent[0]))
@@ -324,13 +325,11 @@ def verify_admin(request: Request):
             detail=f"Invalid admin key. {max(0, attempts_left)} attempt(s) remaining before lockout.",
         )
 
-    # Successful auth — clear fail log for this IP
     _admin_fail_log[ip] = []
     return key
 
 
 def verify_api_key(request: Request) -> dict:
-    """Validate the user's license key (X-API-Key header)."""
     raw = request.headers.get("X-API-Key", "")
     if not raw:
         raise HTTPException(status_code=401, detail="Missing X-API-Key header.")
@@ -487,12 +486,11 @@ async def search_pak_by_number(
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Key Info Endpoint (user checks their own key)
+# Key Info Endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/key/info")
 async def key_info(request: Request, key_doc: dict = Depends(verify_api_key)):
-    """Return info about the current key (expiry, type, usage)."""
     expiry = key_doc.get("expires_at")
     now    = datetime.now(timezone.utc)
 
@@ -517,7 +515,7 @@ async def key_info(request: Request, key_doc: dict = Depends(verify_api_key)):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Admin — Key Management
+# Pydantic models
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GenerateKeyRequest(BaseModel):
@@ -527,8 +525,26 @@ class GenerateKeyRequest(BaseModel):
 
 
 class UpdateLabelRequest(BaseModel):
-    label: str = Field("", max_length=120, description="New label/note (empty string clears it)")
+    label: str = Field("", max_length=120, description="New label (empty string clears it)")
 
+
+class UpdateKeyValueRequest(BaseModel):
+    new_key: str = Field(..., description="New key in NULL-TRACE-API-XXXXXXXX format")
+
+    @field_validator("new_key")
+    @classmethod
+    def validate_format(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not KEY_FORMAT_REGEX.fullmatch(v):
+            raise ValueError(
+                "Key must match NULL-TRACE-API-XXXXXXXX "
+                "(8 uppercase hex chars, e.g. NULL-TRACE-API-A3F9B21C)"
+            )
+        return v
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin — Key Management
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/admin/keys/generate")
 @limiter.limit("10/minute")
@@ -538,22 +554,15 @@ async def admin_generate_keys(
     _admin: str = Depends(verify_admin),
 ):
     """
-    Generate one or more license keys.
+    Generate one or more keys in NULL-TRACE-API-XXXXXXXX format.
     Requires X-Admin-Key header.
-
-    Body:
-      {
-        "type":  "monthly" | "yearly" | "lifetime",
-        "count": 1,
-        "label": "optional note"
-      }
     """
     col  = get_keys_col()
     now  = datetime.now(timezone.utc).isoformat()
     keys = []
 
     for _ in range(body.count):
-        new_key = generate_key()
+        new_key = _unique_key(col)
         doc = {
             "key":         new_key,
             "type":        body.type,
@@ -568,11 +577,7 @@ async def admin_generate_keys(
         doc.pop("_id", None)
         keys.append(doc)
 
-    return {
-        "generated": len(keys),
-        "type":      body.type,
-        "keys":      keys,
-    }
+    return {"generated": len(keys), "type": body.type, "keys": keys}
 
 
 @app.get("/admin/keys")
@@ -581,15 +586,11 @@ async def admin_list_keys(
     request: Request,
     page:     int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
-    type:     Optional[str] = Query(None, description="Filter by type"),
-    revoked:  Optional[bool] = Query(None, description="Filter by revoked status"),
+    type:     Optional[str]  = Query(None),
+    revoked:  Optional[bool] = Query(None),
     _admin:   str = Depends(verify_admin),
 ):
-    """
-    List all keys (paginated).
-    Requires X-Admin-Key header.
-    """
-    col    = get_keys_col()
+    col   = get_keys_col()
     filt: dict = {}
     if type:
         filt["type"] = type
@@ -606,8 +607,8 @@ async def admin_list_keys(
         doc.pop("_id", None)
         expiry = doc.get("expires_at")
         if expiry:
-            exp_dt       = datetime.fromisoformat(expiry)
-            doc["status"] = "expired" if now >= exp_dt else "active"
+            exp_dt           = datetime.fromisoformat(expiry)
+            doc["status"]    = "expired" if now >= exp_dt else "active"
             doc["days_left"] = max(0, (exp_dt - now).days)
         else:
             doc["status"]    = "revoked" if doc.get("revoked") else "lifetime"
@@ -615,25 +616,18 @@ async def admin_list_keys(
         keys.append(doc)
 
     return {
-        "total":    total,
-        "page":     page,
+        "total": total, "page": page,
         "per_page": per_page,
-        "pages":    (total + per_page - 1) // per_page,
-        "keys":     keys,
+        "pages": (total + per_page - 1) // per_page,
+        "keys": keys,
     }
 
 
 @app.delete("/admin/keys/{key_value}")
 @limiter.limit("10/minute")
 async def admin_revoke_key(
-    request:   Request,
-    key_value: str,
-    _admin:    str = Depends(verify_admin),
+    request: Request, key_value: str, _admin: str = Depends(verify_admin),
 ):
-    """
-    Revoke a key by value (marks as revoked, does NOT delete).
-    Requires X-Admin-Key header.
-    """
     col    = get_keys_col()
     result = col.update_one(
         {"key": key_value},
@@ -647,14 +641,8 @@ async def admin_revoke_key(
 @app.delete("/admin/keys/{key_value}/hard")
 @limiter.limit("10/minute")
 async def admin_delete_key(
-    request:   Request,
-    key_value: str,
-    _admin:    str = Depends(verify_admin),
+    request: Request, key_value: str, _admin: str = Depends(verify_admin),
 ):
-    """
-    Permanently delete a key from the database.
-    Requires X-Admin-Key header.
-    """
     col    = get_keys_col()
     result = col.delete_one({"key": key_value})
     if result.deleted_count == 0:
@@ -665,11 +653,8 @@ async def admin_delete_key(
 @app.post("/admin/keys/{key_value}/unrevoke")
 @limiter.limit("10/minute")
 async def admin_unrevoke_key(
-    request:   Request,
-    key_value: str,
-    _admin:    str = Depends(verify_admin),
+    request: Request, key_value: str, _admin: str = Depends(verify_admin),
 ):
-    """Re-activate a previously revoked key."""
     col    = get_keys_col()
     result = col.update_one(
         {"key": key_value},
@@ -680,42 +665,65 @@ async def admin_unrevoke_key(
     return {"unrevoked": True, "key": key_value}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW: Update label on any key (revoked or active)
-# ─────────────────────────────────────────────────────────────────────────────
-
 @app.patch("/admin/keys/{key_value}/label")
 @limiter.limit("20/minute")
 async def admin_update_label(
-    request:   Request,
-    key_value: str,
-    body:      UpdateLabelRequest,
-    _admin:    str = Depends(verify_admin),
+    request: Request, key_value: str,
+    body: UpdateLabelRequest, _admin: str = Depends(verify_admin),
 ):
-    """
-    Update (or clear) the label/note on a key.
-    Works on both active and revoked keys.
-    Requires X-Admin-Key header.
-
-    Body:
-      { "label": "new note here" }   — set a new label
-      { "label": "" }                — clear the label
-    """
+    """Update or clear the label/note on a key."""
     col    = get_keys_col()
     result = col.update_one(
         {"key": key_value},
-        {
-            "$set": {
-                "label":      body.label,
-                "label_updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        },
+        {"$set": {"label": body.label, "label_updated_at": datetime.now(timezone.utc).isoformat()}},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
-
-    logger.info("Label updated for key %s → '%s'", key_value, body.label)
+    logger.info("Label updated: %s → '%s'", key_value, body.label)
     return {"updated": True, "key": key_value, "label": body.label}
+
+
+@app.patch("/admin/keys/{key_value}/value")
+@limiter.limit("20/minute")
+async def admin_update_key_value(
+    request:   Request,
+    key_value: str,
+    body:      UpdateKeyValueRequest,
+    _admin:    str = Depends(verify_admin),
+):
+    """
+    Replace the key string itself with a new NULL-TRACE-API-XXXXXXXX value.
+
+    - The old key immediately stops working.
+    - All metadata (type, expiry, label, usage count, etc.) is preserved.
+    - Returns 404 if the old key doesn't exist.
+    - Returns 409 if the new key value is already taken.
+
+    Body: { "new_key": "NULL-TRACE-API-A3F9B21C" }
+    """
+    col = get_keys_col()
+
+    # Confirm the key being edited exists
+    if not col.find_one({"key": key_value}):
+        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+
+    # Confirm the new value isn't already used by a different document
+    if body.new_key != key_value and col.find_one({"key": body.new_key}):
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{body.new_key}' is already in use. Choose a different value.",
+        )
+
+    col.update_one(
+        {"key": key_value},
+        {"$set": {
+            "key":            body.new_key,
+            "key_updated_at": datetime.now(timezone.utc).isoformat(),
+        }},
+    )
+
+    logger.info("Key value changed: %s → %s", key_value, body.new_key)
+    return {"updated": True, "old_key": key_value, "new_key": body.new_key}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Visitor Counter
@@ -727,10 +735,7 @@ async def record_visit(request: Request):
         visits = get_main_db()["visits"]
         visits.update_one(
             {"_id": "global_counter"},
-            {
-                "$inc": {"total": 1},
-                "$set": {"last_visit": datetime.now(timezone.utc).isoformat()},
-            },
+            {"$inc": {"total": 1}, "$set": {"last_visit": datetime.now(timezone.utc).isoformat()}},
             upsert=True,
         )
         doc = visits.find_one({"_id": "global_counter"})
@@ -768,13 +773,8 @@ async def health():
         key_col  = key_db["keys"]
         return {
             "status": "ok",
-            "main_cluster": {
-                c: main_db[c].count_documents({})
-                for c in ["address", "pan", "personal"]
-            },
-            "email_cluster": {
-                "email": email_db["email"].count_documents({})
-            },
+            "main_cluster": {c: main_db[c].count_documents({}) for c in ["address", "pan", "personal"]},
+            "email_cluster": {"email": email_db["email"].count_documents({})},
             "key_system": {
                 "total_keys":    key_col.count_documents({}),
                 "active_keys":   key_col.count_documents({"revoked": False}),
