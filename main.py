@@ -18,6 +18,11 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Literal, Optional
 
+import phonenumbers
+from phonenumbers import carrier, geocoder
+from phonenumbers import timezone as ph_timezone
+from phonenumbers import number_type, PhoneNumberType
+
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -39,11 +44,11 @@ load_dotenv()
 MONGO_URL       = os.getenv("MONGO_URL", "")
 MONGO_EMAIL_URL = os.getenv("MONGO_EMAIL_URL", "")
 MONGO_KEY_URL   = os.getenv("MONGO_KEY_URL")
-MONGO_CUST_URL  = os.getenv("MONGO_URI", "")          # customer_database cluster
+MONGO_CUST_URL  = os.getenv("MONGO_URI", "")
 
 DB_NAME         = os.getenv("DB_NAME")
 KEY_DB_NAME     = os.getenv("KEY_DB_NAME")
-CUST_DB_NAME    = "customer_database"                  # fixed — matches Atlas
+CUST_DB_NAME    = "customer_database"
 
 IMAGE_BASE      = os.getenv("IMAGE_BASE_URL").rstrip("/")
 ADMIN_KEY       = os.getenv("ADMIN_KEY")
@@ -197,6 +202,93 @@ async def shutdown():
             c.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phone metadata helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PHONE_TYPE_MAP = {
+    PhoneNumberType.MOBILE:               "MOBILE",
+    PhoneNumberType.FIXED_LINE:           "FIXED_LINE",
+    PhoneNumberType.FIXED_LINE_OR_MOBILE: "FIXED_LINE_OR_MOBILE",
+    PhoneNumberType.VOIP:                 "VOIP",
+    PhoneNumberType.TOLL_FREE:            "TOLL_FREE",
+    PhoneNumberType.PREMIUM_RATE:         "PREMIUM_RATE",
+    PhoneNumberType.SHARED_COST:          "SHARED_COST",
+    PhoneNumberType.PERSONAL_NUMBER:      "PERSONAL_NUMBER",
+    PhoneNumberType.PAGER:                "PAGER",
+    PhoneNumberType.UAN:                  "UAN",
+    PhoneNumberType.UNKNOWN:              "UNKNOWN",
+}
+
+
+def get_phone_meta(raw: str, country_prefix: str = "+91") -> dict:
+    try:
+        full   = f"{country_prefix}{raw[-10:]}"
+        number = phonenumbers.parse(full)
+        nt     = number_type(number)
+        return {
+            "international_format": phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
+            "national_format":      phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.NATIONAL),
+            "e164_format":          phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164),
+            "country_code":         number.country_code,
+            "is_valid":             phonenumbers.is_valid_number(number),
+            "is_possible":          phonenumbers.is_possible_number(number),
+            "carrier":              carrier.name_for_number(number, "en") or None,
+            "location":             geocoder.description_for_number(number, "en") or None,
+            "timezones":            list(ph_timezone.time_zones_for_number(number)),
+            "number_type":          _PHONE_TYPE_MAP.get(nt, "UNKNOWN"),
+        }
+    except Exception as e:
+        logger.warning("phone_meta failed for %s: %s", raw, e)
+        return {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Country-specific phone validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Indian numbers: 10 digits, must start with 6, 7, 8, or 9
+IND_PHONE_REGEX = re.compile(r"^[6-9]\d{9}$")
+
+# Pakistani numbers: 10 digits, must start with 3 (e.g. 3001234567)
+# Also accepts 11-digit with leading 0 (03001234567)
+PAK_PHONE_REGEX = re.compile(r"^(0?3\d{9})$")
+
+
+def validate_ind_phone(value: str) -> str:
+    """Validate and normalise an Indian phone number to 10 digits."""
+    cleaned = re.sub(r"[\s\-\(\)\+]", "", value.strip())
+    # Strip country code if present: +91xxxxxxxxxx or 91xxxxxxxxxx
+    cleaned = re.sub(r"^(91)(?=[6-9])", "", cleaned)
+    if not IND_PHONE_REGEX.fullmatch(cleaned):
+        raise HTTPException(
+            422,
+            detail=(
+                "Invalid Indian phone number. "
+                "Expected 10 digits starting with 6–9 (e.g. 9876543210). "
+                "Do not use a Pakistani number on this endpoint."
+            ),
+        )
+    return cleaned
+
+
+def validate_pak_phone(value: str) -> str:
+    """Validate and normalise a Pakistani phone number to 10 digits."""
+    cleaned = re.sub(r"[\s\-\(\)\+]", "", value.strip())
+    # Strip country code if present: +92xxxxxxxxxx or 92xxxxxxxxxx
+    cleaned = re.sub(r"^(92)(?=3)", "", cleaned)
+    if not PAK_PHONE_REGEX.fullmatch(cleaned):
+        raise HTTPException(
+            422,
+            detail=(
+                "Invalid Pakistani phone number. "
+                "Expected 10 digits starting with 3 (e.g. 3001234567) "
+                "or 11 digits with leading 0 (e.g. 03001234567). "
+                "Do not use an Indian number on this endpoint."
+            ),
+        )
+    # Normalise: strip leading 0 → always 10 digits
+    return cleaned.lstrip("0") if cleaned.startswith("0") else cleaned
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Key helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -274,18 +366,10 @@ def verify_api_key(request: Request) -> dict:
     return resolve_key(raw)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Validation
+# Validation (generic — kept for email)
 # ─────────────────────────────────────────────────────────────────────────────
 
-PHONE_REGEX = re.compile(r"^\d{10}(\d{2})?$")
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
-
-
-def validate_phone(value: str) -> str:
-    cleaned = re.sub(r"[\s\-]", "", value.strip())
-    if not PHONE_REGEX.fullmatch(cleaned):
-        raise HTTPException(422, detail=f"'{value}' is not a valid phone number.")
-    return cleaned
 
 
 def validate_email(value: str) -> str:
@@ -298,10 +382,10 @@ def validate_email(value: str) -> str:
 # Serializers — original collections
 # ─────────────────────────────────────────────────────────────────────────────
 
-ADDRESS_FIELDS  = {"name","number","email","dob","city","address"}
-PAN_FIELDS      = {"name","number","email","city","pan"}
-EMAIL_FIELDS    = {"name","number","email","city"}
-PERSONAL_FIELDS = {"userId","name","fatherName","cnic","mobile","email","address","gender","createdAt"}
+ADDRESS_FIELDS  = {"name", "number", "email", "dob", "city", "address"}
+PAN_FIELDS      = {"name", "number", "email", "city", "pan"}
+EMAIL_FIELDS    = {"name", "number", "email", "city"}
+PERSONAL_FIELDS = {"userId", "name", "fatherName", "cnic", "mobile", "email", "address", "gender", "createdAt"}
 
 def strip_id(d): d.pop("_id", None); return d
 
@@ -331,9 +415,6 @@ def safe_personal(docs):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Serializers — customers_db1
-# Fields: number, alternate_number, name, dob,
-#         address1, address2, address3, city, pincode, state,
-#         email, sim, connection_type
 # ─────────────────────────────────────────────────────────────────────────────
 
 CUST_DB1_FIELDS = {
@@ -348,10 +429,6 @@ def safe_cust_db1(docs: list) -> list:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Serializers — customers_db2
-# Fields: telephone_number, name, dob, father_husband_name,
-#         address1, address2, address3, city, postal, state,
-#         alternate_phone, email, nationality, pan_gir,
-#         connection_type, service_provider
 # ─────────────────────────────────────────────────────────────────────────────
 
 CUST_DB2_FIELDS = {
@@ -401,19 +478,20 @@ def email_filter(em):
 @limiter.limit(RATE_LIMIT)
 async def search_ind_by_number(
     request: Request,
-    q: str = Query(..., min_length=10, max_length=12),
+    q: str = Query(..., min_length=10, max_length=13),
     _k: dict = Depends(verify_api_key),
 ):
-    n   = validate_phone(q)
-    f   = phone_filter(n)
-    a   = list(get_col("address").find(f,                         limit=MAX_RESULTS))
-    p   = list(get_col("pan").find(f,                             limit=MAX_RESULTS))
-    e   = list(get_col("email").find(f,                           limit=MAX_RESULTS))
-    c1  = list(get_cust_db()["customers_db1"].find(phone_filter_db1(n), limit=MAX_RESULTS))
-    c2  = list(get_cust_db()["customers_db2"].find(phone_filter_db2(n), limit=MAX_RESULTS))
+    n  = validate_ind_phone(q)
+    f  = phone_filter(n)
+    a  = list(get_col("address").find(f,                               limit=MAX_RESULTS))
+    p  = list(get_col("pan").find(f,                                   limit=MAX_RESULTS))
+    e  = list(get_col("email").find(f,                                 limit=MAX_RESULTS))
+    c1 = list(get_cust_db()["customers_db1"].find(phone_filter_db1(n), limit=MAX_RESULTS))
+    c2 = list(get_cust_db()["customers_db2"].find(phone_filter_db2(n), limit=MAX_RESULTS))
     return {
         "query":         n,
-        "total":         len(a)+len(p)+len(e)+len(c1)+len(c2),
+        "total":         len(a) + len(p) + len(e) + len(c1) + len(c2),
+        "phone_meta":    get_phone_meta(n, country_prefix="+91"),
         "address":       {"count": len(a),  "results": safe_address(a)},
         "pan":           {"count": len(p),  "results": safe_pan(p)},
         "email":         {"count": len(e),  "results": safe_email_docs(e)},
@@ -429,16 +507,16 @@ async def search_ind_by_email(
     q: str = Query(..., min_length=6, max_length=254),
     _k: dict = Depends(verify_api_key),
 ):
-    em  = validate_email(q)
-    f   = email_filter(em)
-    a   = list(get_col("address").find(f,                    limit=MAX_RESULTS))
-    p   = list(get_col("pan").find(f,                        limit=MAX_RESULTS))
-    e   = list(get_col("email").find(f,                      limit=MAX_RESULTS))
-    c1  = list(get_cust_db()["customers_db1"].find(email_filter(em), limit=MAX_RESULTS))
-    c2  = list(get_cust_db()["customers_db2"].find(email_filter(em), limit=MAX_RESULTS))
+    em = validate_email(q)
+    f  = email_filter(em)
+    a  = list(get_col("address").find(f,                          limit=MAX_RESULTS))
+    p  = list(get_col("pan").find(f,                              limit=MAX_RESULTS))
+    e  = list(get_col("email").find(f,                            limit=MAX_RESULTS))
+    c1 = list(get_cust_db()["customers_db1"].find(email_filter(em), limit=MAX_RESULTS))
+    c2 = list(get_cust_db()["customers_db2"].find(email_filter(em), limit=MAX_RESULTS))
     return {
         "query":         em,
-        "total":         len(a)+len(p)+len(e)+len(c1)+len(c2),
+        "total":         len(a) + len(p) + len(e) + len(c1) + len(c2),
         "address":       {"count": len(a),  "results": safe_address(a)},
         "pan":           {"count": len(p),  "results": safe_pan(p)},
         "email":         {"count": len(e),  "results": safe_email_docs(e)},
@@ -451,12 +529,18 @@ async def search_ind_by_email(
 @limiter.limit(RATE_LIMIT)
 async def search_pak_by_number(
     request: Request,
-    q: str = Query(..., min_length=10, max_length=12),
+    q: str = Query(..., min_length=10, max_length=13),
     _k: dict = Depends(verify_api_key),
 ):
-    n    = validate_phone(q)
+    n    = validate_pak_phone(q)
     docs = list(get_col("personal").find(phone_filter_pak(n), limit=MAX_RESULTS))
-    return {"query": n, "count": len(docs), "results": safe_personal(docs)}
+    return {
+        "query":      n,
+        "total":      len(docs),
+        "phone_meta": get_phone_meta(n, country_prefix="+92"),
+        "count":      len(docs),
+        "results":    safe_personal(docs),
+    }
 
 
 @app.get("/search/pak/email")
@@ -468,7 +552,11 @@ async def search_pak_by_email(
 ):
     em   = validate_email(q)
     docs = list(get_col("personal").find(email_filter(em), limit=MAX_RESULTS))
-    return {"query": em, "count": len(docs), "results": safe_personal(docs)}
+    return {
+        "query":   em,
+        "count":   len(docs),
+        "results": safe_personal(docs),
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Key info (user endpoint)
@@ -480,19 +568,19 @@ async def key_info(request: Request, key_doc: dict = Depends(verify_api_key)):
     now    = datetime.now(timezone.utc)
     if expiry:
         exp_dt = datetime.fromisoformat(expiry)
-        days_left, expires_str = max(0,(exp_dt-now).days), exp_dt.strftime("%Y-%m-%d %H:%M UTC")
+        days_left, expires_str = max(0, (exp_dt - now).days), exp_dt.strftime("%Y-%m-%d %H:%M UTC")
     else:
         days_left, expires_str = None, "Never (lifetime)"
     return {
         "key":         key_doc["key"],
-        "type":        key_doc.get("type","unknown"),
-        "label":       key_doc.get("label",""),
+        "type":        key_doc.get("type", "unknown"),
+        "label":       key_doc.get("label", ""),
         "active":      True,
         "expires_at":  expires_str,
         "days_left":   days_left,
-        "usage_count": key_doc.get("usage_count",0),
-        "last_used":   key_doc.get("last_used","never"),
-        "created_at":  key_doc.get("created_at",""),
+        "usage_count": key_doc.get("usage_count", 0),
+        "last_used":   key_doc.get("last_used", "never"),
+        "created_at":  key_doc.get("created_at", ""),
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -552,19 +640,19 @@ async def admin_list_keys(
     total = col.count_documents(filt)
     keys  = []
     now   = datetime.now(timezone.utc)
-    for doc in col.find(filt).sort("created_at", -1).skip((page-1)*per_page).limit(per_page):
+    for doc in col.find(filt).sort("created_at", -1).skip((page - 1) * per_page).limit(per_page):
         doc.pop("_id", None)
         expiry = doc.get("expires_at")
         if expiry:
-            exp_dt       = datetime.fromisoformat(expiry)
+            exp_dt           = datetime.fromisoformat(expiry)
             doc["status"]    = "expired" if now >= exp_dt else "active"
-            doc["days_left"] = max(0, (exp_dt-now).days)
+            doc["days_left"] = max(0, (exp_dt - now).days)
         else:
             doc["status"]    = "revoked" if doc.get("revoked") else "lifetime"
             doc["days_left"] = None
         keys.append(doc)
     return {"total": total, "page": page, "per_page": per_page,
-            "pages": (total+per_page-1)//per_page, "keys": keys}
+            "pages": (total + per_page - 1) // per_page, "keys": keys}
 
 
 @app.delete("/admin/keys/{key_value}")
@@ -628,10 +716,10 @@ async def admin_update_key_value(request: Request, key_value: str, body: UpdateK
 async def record_visit(request: Request):
     try:
         v = get_main_db()["visits"]
-        v.update_one({"_id":"global_counter"},
-                     {"$inc":{"total":1},"$set":{"last_visit":datetime.now(timezone.utc).isoformat()}},
+        v.update_one({"_id": "global_counter"},
+                     {"$inc": {"total": 1}, "$set": {"last_visit": datetime.now(timezone.utc).isoformat()}},
                      upsert=True)
-        d = v.find_one({"_id":"global_counter"})
+        d = v.find_one({"_id": "global_counter"})
         return {"total": d["total"] if d else 1}
     except Exception as e:
         logger.error("Visit counter: %s", e); return {"total": 0}
@@ -640,7 +728,7 @@ async def record_visit(request: Request):
 @app.get("/visit")
 async def get_visits():
     try:
-        d = get_main_db()["visits"].find_one({"_id":"global_counter"})
+        d = get_main_db()["visits"].find_one({"_id": "global_counter"})
         return {"total": d["total"] if d else 0}
     except Exception as e:
         logger.error("Get visits: %s", e); return {"total": 0}
@@ -661,23 +749,23 @@ async def health():
         email_db = get_email_db()
         key_db   = get_key_db()
         cust_db  = get_cust_db()
-        visits   = main_db["visits"].find_one({"_id":"global_counter"})
+        visits   = main_db["visits"].find_one({"_id": "global_counter"})
         kc       = key_db["keys"]
         return {
             "status": "ok",
-            "main_cluster": {c: main_db[c].count_documents({}) for c in ["address","pan","personal"]},
-            "email_cluster": {"email": email_db["email"].count_documents({})},
+            "main_cluster":     {c: main_db[c].count_documents({}) for c in ["address", "pan", "personal"]},
+            "email_cluster":    {"email": email_db["email"].count_documents({})},
             "customer_cluster": {
                 "customers_db1": cust_db["customers_db1"].count_documents({}),
                 "customers_db2": cust_db["customers_db2"].count_documents({}),
             },
             "key_system": {
                 "total_keys":    kc.count_documents({}),
-                "active_keys":   kc.count_documents({"revoked":False}),
-                "revoked_keys":  kc.count_documents({"revoked":True}),
-                "monthly_keys":  kc.count_documents({"type":"monthly"}),
-                "yearly_keys":   kc.count_documents({"type":"yearly"}),
-                "lifetime_keys": kc.count_documents({"type":"lifetime"}),
+                "active_keys":   kc.count_documents({"revoked": False}),
+                "revoked_keys":  kc.count_documents({"revoked": True}),
+                "monthly_keys":  kc.count_documents({"type": "monthly"}),
+                "yearly_keys":   kc.count_documents({"type": "yearly"}),
+                "lifetime_keys": kc.count_documents({"type": "lifetime"}),
             },
             "visitors": visits["total"] if visits else 0,
         }
