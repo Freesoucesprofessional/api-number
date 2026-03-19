@@ -1,8 +1,11 @@
 """
 Secure Lookup API — Dual MongoDB Edition + Key Management System
 =================================================================
-Key format on generation: NULL-TRACE-API-XXXXXXXX  (8 hex chars)
-Key rename (admin edit):  any string the admin chooses (max 120 chars)
+Routes:
+  /search/ind/number   — India phone  (address + pan + email + customers_db1 + customers_db2)
+  /search/ind/email    — India email  (address + pan + email + customers_db1 + customers_db2)
+  /search/pak/number   — Pakistan phone (personal)
+  /search/pak/email    — Pakistan email (personal)
 """
 
 import re
@@ -36,8 +39,12 @@ load_dotenv()
 MONGO_URL       = os.getenv("MONGO_URL", "")
 MONGO_EMAIL_URL = os.getenv("MONGO_EMAIL_URL", "")
 MONGO_KEY_URL   = os.getenv("MONGO_KEY_URL")
+MONGO_CUST_URL  = os.getenv("MONGO_URI", "")          # customer_database cluster
+
 DB_NAME         = os.getenv("DB_NAME")
 KEY_DB_NAME     = os.getenv("KEY_DB_NAME")
+CUST_DB_NAME    = "customer_database"                  # fixed — matches Atlas
+
 IMAGE_BASE      = os.getenv("IMAGE_BASE_URL").rstrip("/")
 ADMIN_KEY       = os.getenv("ADMIN_KEY")
 RATE_LIMIT      = os.getenv("RATE_LIMIT")
@@ -79,6 +86,7 @@ app.add_middleware(
 _main_client:  MongoClient | None = None
 _email_client: MongoClient | None = None
 _key_client:   MongoClient | None = None
+_cust_client:  MongoClient | None = None
 
 
 def get_main_db():
@@ -108,6 +116,15 @@ def get_key_db():
     return _key_client[KEY_DB_NAME]
 
 
+def get_cust_db():
+    global _cust_client
+    if _cust_client is None:
+        if not MONGO_CUST_URL:
+            raise RuntimeError("MONGO_URI (customer DB) is not set.")
+        _cust_client = MongoClient(MONGO_CUST_URL, serverSelectionTimeoutMS=5000)
+    return _cust_client[CUST_DB_NAME]
+
+
 def get_col(name: str) -> Collection:
     return get_email_db()[name] if name == "email" else get_main_db()[name]
 
@@ -115,6 +132,10 @@ def get_col(name: str) -> Collection:
 def get_keys_col() -> Collection:
     return get_key_db()["keys"]
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Startup / shutdown
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
@@ -128,7 +149,8 @@ async def startup():
 
     try:
         db = get_email_db(); db.command("ping")
-        logger.info("✓ Email cluster connected — email: %s records", f"{db['email'].count_documents({}):,}")
+        logger.info("✓ Email cluster — email: %s records",
+                    f"{db['email'].count_documents({}):,}")
     except Exception as e:
         logger.error("✗ Email cluster: %s", e)
 
@@ -136,9 +158,18 @@ async def startup():
         db  = get_key_db(); db.command("ping")
         col = db["keys"]
         col.create_index([("key", ASCENDING)], unique=True)
-        logger.info("✓ Key cluster connected — %s keys stored", col.count_documents({}))
+        logger.info("✓ Key cluster — %s keys stored", col.count_documents({}))
     except Exception as e:
         logger.error("✗ Key cluster: %s", e)
+
+    try:
+        db  = get_cust_db(); db.command("ping")
+        c1  = db["customers_db1"].count_documents({})
+        c2  = db["customers_db2"].count_documents({})
+        logger.info("✓ Customer cluster — customers_db1: %s | customers_db2: %s",
+                    f"{c1:,}", f"{c2:,}")
+    except Exception as e:
+        logger.error("✗ Customer cluster: %s", e)
 
     asyncio.create_task(_keep_alive())
 
@@ -160,16 +191,16 @@ async def _keep_alive():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _main_client, _email_client, _key_client
-    for c in [_main_client, _email_client, _key_client]:
-        if c: c.close()
+    global _main_client, _email_client, _key_client, _cust_client
+    for c in [_main_client, _email_client, _key_client, _cust_client]:
+        if c:
+            c.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Key helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 KeyType = Literal["monthly", "yearly", "lifetime"]
-
 KEY_DURATIONS: dict[str, Optional[timedelta]] = {
     "monthly":  timedelta(days=30),
     "yearly":   timedelta(days=365),
@@ -178,7 +209,6 @@ KEY_DURATIONS: dict[str, Optional[timedelta]] = {
 
 
 def generate_key() -> str:
-    """Auto-generate: NULL-TRACE-API-XXXXXXXX (8 uppercase hex chars)."""
     return f"NULL-TRACE-API-{uuid.uuid4().hex[:8].upper()}"
 
 
@@ -187,7 +217,7 @@ def _unique_key(col: Collection) -> str:
         k = generate_key()
         if not col.find_one({"key": k}):
             return k
-    return generate_key()          # virtually impossible to collide 10 times
+    return generate_key()
 
 
 def compute_expiry(key_type: KeyType) -> Optional[str]:
@@ -222,7 +252,7 @@ def _get_ip(request: Request) -> str:
 
 
 def verify_admin(request: Request):
-    ip = _get_ip(request); now = time.time()
+    ip  = _get_ip(request); now = time.time()
     _admin_fail_log[ip] = [t for t in _admin_fail_log[ip] if now - t < ADMIN_LOCKOUT_SECS]
     recent = [t for t in _admin_fail_log[ip] if now - t < ADMIN_LOCKOUT_SECS]
     if len(recent) >= ADMIN_MAX_ATTEMPTS:
@@ -244,7 +274,7 @@ def verify_api_key(request: Request) -> dict:
     return resolve_key(raw)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Validation helpers
+# Validation
 # ─────────────────────────────────────────────────────────────────────────────
 
 PHONE_REGEX = re.compile(r"^\d{10}(\d{2})?$")
@@ -265,7 +295,7 @@ def validate_email(value: str) -> str:
     return cleaned.lower()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Serializers
+# Serializers — original collections
 # ─────────────────────────────────────────────────────────────────────────────
 
 ADDRESS_FIELDS  = {"name","number","email","dob","city","address"}
@@ -274,9 +304,15 @@ EMAIL_FIELDS    = {"name","number","email","city"}
 PERSONAL_FIELDS = {"userId","name","fatherName","cnic","mobile","email","address","gender","createdAt"}
 
 def strip_id(d): d.pop("_id", None); return d
-def safe_address(docs):  return [{k:v for k,v in strip_id(d).items() if k in ADDRESS_FIELDS}  for d in docs]
-def safe_pan(docs):      return [{k:v for k,v in strip_id(d).items() if k in PAN_FIELDS}      for d in docs]
-def safe_email_docs(docs): return [{k:v for k,v in strip_id(d).items() if k in EMAIL_FIELDS}  for d in docs]
+
+def safe_address(docs):
+    return [{k: v for k, v in strip_id(d).items() if k in ADDRESS_FIELDS} for d in docs]
+
+def safe_pan(docs):
+    return [{k: v for k, v in strip_id(d).items() if k in PAN_FIELDS} for d in docs]
+
+def safe_email_docs(docs):
+    return [{k: v for k, v in strip_id(d).items() if k in EMAIL_FIELDS} for d in docs]
 
 def build_image_url(f):
     if not f: return None
@@ -287,49 +323,152 @@ def safe_personal(docs):
     out = []
     for d in docs:
         strip_id(d)
-        e = {k:v for k,v in d.items() if k in PERSONAL_FIELDS}
+        e = {k: v for k, v in d.items() if k in PERSONAL_FIELDS}
         e["profileImageUrl"] = build_image_url(d.get("profileImage"))
         e["cnicImageUrl"]    = build_image_url(d.get("cnicImage"))
         out.append(e)
     return out
 
-def phone_filter(n, field="number"): return {field: {"$regex": f"{n[-10:]}$"}}
-def phone_filter_pak(n):             return {"mobile.digits": {"$regex": f"{n[-10:]}$"}}
+# ─────────────────────────────────────────────────────────────────────────────
+# Serializers — customers_db1
+# Fields: number, alternate_number, name, dob,
+#         address1, address2, address3, city, pincode, state,
+#         email, sim, connection_type
+# ─────────────────────────────────────────────────────────────────────────────
+
+CUST_DB1_FIELDS = {
+    "number", "alternate_number", "name", "dob",
+    "address1", "address2", "address3",
+    "city", "pincode", "state",
+    "email", "sim", "connection_type",
+}
+
+def safe_cust_db1(docs: list) -> list:
+    return [{k: v for k, v in strip_id(d).items() if k in CUST_DB1_FIELDS} for d in docs]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Serializers — customers_db2
+# Fields: telephone_number, name, dob, father_husband_name,
+#         address1, address2, address3, city, postal, state,
+#         alternate_phone, email, nationality, pan_gir,
+#         connection_type, service_provider
+# ─────────────────────────────────────────────────────────────────────────────
+
+CUST_DB2_FIELDS = {
+    "telephone_number", "name", "dob", "father_husband_name",
+    "address1", "address2", "address3",
+    "city", "postal", "state",
+    "alternate_phone", "email",
+    "nationality", "pan_gir",
+    "connection_type", "service_provider",
+}
+
+def safe_cust_db2(docs: list) -> list:
+    return [{k: v for k, v in strip_id(d).items() if k in CUST_DB2_FIELDS} for d in docs]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phone / email filter helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def phone_filter(n, field="number"):
+    return {field: {"$regex": f"{n[-10:]}$"}}
+
+def phone_filter_pak(n):
+    return {"mobile.digits": {"$regex": f"{n[-10:]}$"}}
+
+def phone_filter_db1(n):
+    tail = n[-10:]
+    return {"$or": [
+        {"number":           {"$regex": f"{tail}$"}},
+        {"alternate_number": {"$regex": f"{tail}$"}},
+    ]}
+
+def phone_filter_db2(n):
+    tail = n[-10:]
+    return {"$or": [
+        {"telephone_number": {"$regex": f"{tail}$"}},
+        {"alternate_phone":  {"$regex": f"{tail}$"}},
+    ]}
+
+def email_filter(em):
+    return {"email": {"$regex": f"^{re.escape(em)}$", "$options": "i"}}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Search endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/search/number")
+@app.get("/search/ind/number")
 @limiter.limit(RATE_LIMIT)
-async def search_by_number(request: Request, q: str = Query(..., min_length=10, max_length=12), _k: dict = Depends(verify_api_key)):
-    n = validate_phone(q)
-    f = phone_filter(n)
-    return {"query": n, "total": 0,
-            "address": {"count": len(a := list(get_col("address").find(f, limit=MAX_RESULTS))), "results": safe_address(a)},
-            "pan":     {"count": len(p := list(get_col("pan").find(f,     limit=MAX_RESULTS))), "results": safe_pan(p)},
-            "email":   {"count": len(e := list(get_col("email").find(f,   limit=MAX_RESULTS))), "results": safe_email_docs(e)},
-            } | {"total": len(a)+len(p)+len(e)}
+async def search_ind_by_number(
+    request: Request,
+    q: str = Query(..., min_length=10, max_length=12),
+    _k: dict = Depends(verify_api_key),
+):
+    n   = validate_phone(q)
+    f   = phone_filter(n)
+    a   = list(get_col("address").find(f,                         limit=MAX_RESULTS))
+    p   = list(get_col("pan").find(f,                             limit=MAX_RESULTS))
+    e   = list(get_col("email").find(f,                           limit=MAX_RESULTS))
+    c1  = list(get_cust_db()["customers_db1"].find(phone_filter_db1(n), limit=MAX_RESULTS))
+    c2  = list(get_cust_db()["customers_db2"].find(phone_filter_db2(n), limit=MAX_RESULTS))
+    return {
+        "query":         n,
+        "total":         len(a)+len(p)+len(e)+len(c1)+len(c2),
+        "address":       {"count": len(a),  "results": safe_address(a)},
+        "pan":           {"count": len(p),  "results": safe_pan(p)},
+        "email":         {"count": len(e),  "results": safe_email_docs(e)},
+        "customers_db1": {"count": len(c1), "results": safe_cust_db1(c1)},
+        "customers_db2": {"count": len(c2), "results": safe_cust_db2(c2)},
+    }
 
 
-@app.get("/search/email")
+@app.get("/search/ind/email")
 @limiter.limit(RATE_LIMIT)
-async def search_by_email(request: Request, q: str = Query(..., min_length=6, max_length=254), _k: dict = Depends(verify_api_key)):
-    em = validate_email(q)
-    f  = {"email": {"$regex": f"^{re.escape(em)}$", "$options": "i"}}
-    return {"query": em,
-            "address": {"count": len(a := list(get_col("address").find(f, limit=MAX_RESULTS))), "results": safe_address(a)},
-            "pan":     {"count": len(p := list(get_col("pan").find(f,     limit=MAX_RESULTS))), "results": safe_pan(p)},
-            "email":   {"count": len(e := list(get_col("email").find(f,   limit=MAX_RESULTS))), "results": safe_email_docs(e)},
-            "total":   len(a)+len(p)+len(e)}
+async def search_ind_by_email(
+    request: Request,
+    q: str = Query(..., min_length=6, max_length=254),
+    _k: dict = Depends(verify_api_key),
+):
+    em  = validate_email(q)
+    f   = email_filter(em)
+    a   = list(get_col("address").find(f,                    limit=MAX_RESULTS))
+    p   = list(get_col("pan").find(f,                        limit=MAX_RESULTS))
+    e   = list(get_col("email").find(f,                      limit=MAX_RESULTS))
+    c1  = list(get_cust_db()["customers_db1"].find(email_filter(em), limit=MAX_RESULTS))
+    c2  = list(get_cust_db()["customers_db2"].find(email_filter(em), limit=MAX_RESULTS))
+    return {
+        "query":         em,
+        "total":         len(a)+len(p)+len(e)+len(c1)+len(c2),
+        "address":       {"count": len(a),  "results": safe_address(a)},
+        "pan":           {"count": len(p),  "results": safe_pan(p)},
+        "email":         {"count": len(e),  "results": safe_email_docs(e)},
+        "customers_db1": {"count": len(c1), "results": safe_cust_db1(c1)},
+        "customers_db2": {"count": len(c2), "results": safe_cust_db2(c2)},
+    }
 
 
 @app.get("/search/pak/number")
 @limiter.limit(RATE_LIMIT)
-async def search_pak_by_number(request: Request, q: str = Query(..., min_length=10, max_length=12), _k: dict = Depends(verify_api_key)):
+async def search_pak_by_number(
+    request: Request,
+    q: str = Query(..., min_length=10, max_length=12),
+    _k: dict = Depends(verify_api_key),
+):
     n    = validate_phone(q)
     docs = list(get_col("personal").find(phone_filter_pak(n), limit=MAX_RESULTS))
     return {"query": n, "count": len(docs), "results": safe_personal(docs)}
+
+
+@app.get("/search/pak/email")
+@limiter.limit(RATE_LIMIT)
+async def search_pak_by_email(
+    request: Request,
+    q: str = Query(..., min_length=6, max_length=254),
+    _k: dict = Depends(verify_api_key),
+):
+    em   = validate_email(q)
+    docs = list(get_col("personal").find(email_filter(em), limit=MAX_RESULTS))
+    return {"query": em, "count": len(docs), "results": safe_personal(docs)}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Key info (user endpoint)
@@ -345,12 +484,15 @@ async def key_info(request: Request, key_doc: dict = Depends(verify_api_key)):
     else:
         days_left, expires_str = None, "Never (lifetime)"
     return {
-        "key": key_doc["key"], "type": key_doc.get("type","unknown"),
-        "label": key_doc.get("label",""), "active": True,
-        "expires_at": expires_str, "days_left": days_left,
+        "key":         key_doc["key"],
+        "type":        key_doc.get("type","unknown"),
+        "label":       key_doc.get("label",""),
+        "active":      True,
+        "expires_at":  expires_str,
+        "days_left":   days_left,
         "usage_count": key_doc.get("usage_count",0),
-        "last_used": key_doc.get("last_used","never"),
-        "created_at": key_doc.get("created_at",""),
+        "last_used":   key_doc.get("last_used","never"),
+        "created_at":  key_doc.get("created_at",""),
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,19 +504,10 @@ class GenerateKeyRequest(BaseModel):
     count: int     = Field(1, ge=1, le=100)
     label: str     = Field("")
 
-
 class UpdateLabelRequest(BaseModel):
     label: str = Field("", max_length=120)
 
-
 class UpdateKeyValueRequest(BaseModel):
-    """
-    Free-text rename — admin can set any string they like.
-    Rules:
-      - 1–120 characters
-      - No leading/trailing whitespace
-      - No newlines or tab characters
-    """
     new_key: str = Field(..., min_length=1, max_length=120)
 
     @field_validator("new_key")
@@ -398,7 +531,7 @@ async def admin_generate_keys(request: Request, body: GenerateKeyRequest, _admin
     now  = datetime.now(timezone.utc).isoformat()
     keys = []
     for _ in range(body.count):
-        k = _unique_key(col)
+        k   = _unique_key(col)
         doc = {"key": k, "type": body.type, "label": body.label,
                "expires_at": compute_expiry(body.type), "revoked": False,
                "usage_count": 0, "last_used": None, "created_at": now}
@@ -423,7 +556,7 @@ async def admin_list_keys(
         doc.pop("_id", None)
         expiry = doc.get("expires_at")
         if expiry:
-            exp_dt = datetime.fromisoformat(expiry)
+            exp_dt       = datetime.fromisoformat(expiry)
             doc["status"]    = "expired" if now >= exp_dt else "active"
             doc["days_left"] = max(0, (exp_dt-now).days)
         else:
@@ -439,7 +572,8 @@ async def admin_list_keys(
 async def admin_revoke_key(request: Request, key_value: str, _admin: str = Depends(verify_admin)):
     col = get_keys_col()
     r   = col.update_one({"key": key_value}, {"$set": {"revoked": True, "revoked_at": datetime.now(timezone.utc).isoformat()}})
-    if r.matched_count == 0: raise HTTPException(404, detail=f"Key '{key_value}' not found.")
+    if r.matched_count == 0:
+        raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     return {"revoked": True, "key": key_value}
 
 
@@ -448,7 +582,8 @@ async def admin_revoke_key(request: Request, key_value: str, _admin: str = Depen
 async def admin_delete_key(request: Request, key_value: str, _admin: str = Depends(verify_admin)):
     col = get_keys_col()
     r   = col.delete_one({"key": key_value})
-    if r.deleted_count == 0: raise HTTPException(404, detail=f"Key '{key_value}' not found.")
+    if r.deleted_count == 0:
+        raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     return {"deleted": True, "key": key_value}
 
 
@@ -457,7 +592,8 @@ async def admin_delete_key(request: Request, key_value: str, _admin: str = Depen
 async def admin_unrevoke_key(request: Request, key_value: str, _admin: str = Depends(verify_admin)):
     col = get_keys_col()
     r   = col.update_one({"key": key_value}, {"$set": {"revoked": False}, "$unset": {"revoked_at": ""}})
-    if r.matched_count == 0: raise HTTPException(404, detail=f"Key '{key_value}' not found.")
+    if r.matched_count == 0:
+        raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     return {"unrevoked": True, "key": key_value}
 
 
@@ -466,7 +602,8 @@ async def admin_unrevoke_key(request: Request, key_value: str, _admin: str = Dep
 async def admin_update_label(request: Request, key_value: str, body: UpdateLabelRequest, _admin: str = Depends(verify_admin)):
     col = get_keys_col()
     r   = col.update_one({"key": key_value}, {"$set": {"label": body.label, "label_updated_at": datetime.now(timezone.utc).isoformat()}})
-    if r.matched_count == 0: raise HTTPException(404, detail=f"Key '{key_value}' not found.")
+    if r.matched_count == 0:
+        raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     logger.info("Label updated: %s → '%s'", key_value, body.label)
     return {"updated": True, "key": key_value, "label": body.label}
 
@@ -474,12 +611,6 @@ async def admin_update_label(request: Request, key_value: str, body: UpdateLabel
 @app.patch("/admin/keys/{key_value}/value")
 @limiter.limit("20/minute")
 async def admin_update_key_value(request: Request, key_value: str, body: UpdateKeyValueRequest, _admin: str = Depends(verify_admin)):
-    """
-    Rename a key to any string the admin chooses (no format restriction).
-    - Old key immediately stops working; new key string inherits all metadata.
-    - 404 if old key not found.
-    - 409 if new key string is already taken by another document.
-    """
     col = get_keys_col()
     if not col.find_one({"key": key_value}):
         raise HTTPException(404, detail=f"Key '{key_value}' not found.")
@@ -497,7 +628,9 @@ async def admin_update_key_value(request: Request, key_value: str, body: UpdateK
 async def record_visit(request: Request):
     try:
         v = get_main_db()["visits"]
-        v.update_one({"_id":"global_counter"}, {"$inc":{"total":1},"$set":{"last_visit":datetime.now(timezone.utc).isoformat()}}, upsert=True)
+        v.update_one({"_id":"global_counter"},
+                     {"$inc":{"total":1},"$set":{"last_visit":datetime.now(timezone.utc).isoformat()}},
+                     upsert=True)
         d = v.find_one({"_id":"global_counter"})
         return {"total": d["total"] if d else 1}
     except Exception as e:
@@ -517,7 +650,8 @@ async def get_visits():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.head("/health")
-async def health_head(): return JSONResponse(content=None, status_code=200)
+async def health_head():
+    return JSONResponse(content=None, status_code=200)
 
 
 @app.get("/health")
@@ -526,12 +660,17 @@ async def health():
         main_db  = get_main_db()
         email_db = get_email_db()
         key_db   = get_key_db()
+        cust_db  = get_cust_db()
         visits   = main_db["visits"].find_one({"_id":"global_counter"})
         kc       = key_db["keys"]
         return {
             "status": "ok",
-            "main_cluster":  {c: main_db[c].count_documents({}) for c in ["address","pan","personal"]},
+            "main_cluster": {c: main_db[c].count_documents({}) for c in ["address","pan","personal"]},
             "email_cluster": {"email": email_db["email"].count_documents({})},
+            "customer_cluster": {
+                "customers_db1": cust_db["customers_db1"].count_documents({}),
+                "customers_db2": cust_db["customers_db2"].count_documents({}),
+            },
             "key_system": {
                 "total_keys":    kc.count_documents({}),
                 "active_keys":   kc.count_documents({"revoked":False}),
@@ -543,4 +682,4 @@ async def health():
             "visitors": visits["total"] if visits else 0,
         }
     except Exception as e:
-        return {"status":"error","detail":str(e)}
+        return {"status": "error", "detail": str(e)}
