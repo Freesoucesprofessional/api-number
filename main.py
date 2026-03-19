@@ -1,36 +1,8 @@
 """
 Secure Lookup API — Dual MongoDB Edition + Key Management System
 =================================================================
-Two MongoDB clusters:
-  MONGO_URL       → address, pan, personal, visits  (main cluster)
-  MONGO_EMAIL_URL → email collection                (dedicated cluster)
-  MONGO_KEY_URL   → keys collection                 (key management cluster)
-
-Key Types:
-  - monthly   : valid for 1 month from activation
-  - yearly    : valid for 1 year from activation
-  - lifetime  : never expires
-
-Endpoints:
-  GET  /search/number?q=<phone>     — address + pan + email (India)
-  GET  /search/email?q=<email>      — address + pan + email (India)
-  GET  /search/pak/number?q=<phone> — personal (Pakistan) with images
-  POST /visit                       — increment + return visitor count
-  GET  /visit                       — return current visitor count
-  HEAD /health                      — uptime check (UptimeRobot)
-  GET  /health                      — full status with collection counts
-
-  [Admin — requires X-Admin-Key header]
-  POST   /admin/keys/generate           — generate keys (NULL-TRACE-API-XXXXXXXX)
-  GET    /admin/keys                    — list all keys (paginated)
-  DELETE /admin/keys/{key}              — revoke a key
-  DELETE /admin/keys/{key}/hard         — permanently delete a key
-  POST   /admin/keys/{key}/unrevoke     — restore a revoked key
-  PATCH  /admin/keys/{key}/label        — update label/note
-  PATCH  /admin/keys/{key}/value        — change the key string itself  ← NEW
-
-  [User — requires X-API-Key header (the license key itself)]
-  GET  /key/info                    — check key status, expiry, usage
+Key format on generation: NULL-TRACE-API-XXXXXXXX  (8 hex chars)
+Key rename (admin edit):  any string the admin chooses (max 120 chars)
 """
 
 import re
@@ -63,27 +35,19 @@ load_dotenv()
 
 MONGO_URL       = os.getenv("MONGO_URL", "")
 MONGO_EMAIL_URL = os.getenv("MONGO_EMAIL_URL", "")
-MONGO_KEY_URL   = os.getenv(
-    "MONGO_KEY_URL",
-    "mongodb+srv://telegrambotbydanger:siPJXsL56GQ03onP@cluster0.0om9qyw.mongodb.net/?appName=Cluster0"
-)
-DB_NAME         = os.getenv("DB_NAME", "pakdata")
-KEY_DB_NAME     = os.getenv("KEY_DB_NAME", "keystore")
-IMAGE_BASE      = os.getenv("IMAGE_BASE_URL", "https://pub-1c3225cdd2454dafa1768bf8b067d3a3.r2.dev").rstrip("/")
-
-ADMIN_KEY       = os.getenv("ADMIN_KEY", "change-this-admin-secret")
-
-RATE_LIMIT  = os.getenv("RATE_LIMIT", "10/minute")
-MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
+MONGO_KEY_URL   = os.getenv("MONGO_KEY_URL")
+DB_NAME         = os.getenv("DB_NAME")
+KEY_DB_NAME     = os.getenv("KEY_DB_NAME")
+IMAGE_BASE      = os.getenv("IMAGE_BASE_URL").rstrip("/")
+ADMIN_KEY       = os.getenv("ADMIN_KEY")
+RATE_LIMIT      = os.getenv("RATE_LIMIT")
+MAX_RESULTS     = int(os.getenv("MAX_RESULTS"))
 
 ADMIN_MAX_ATTEMPTS   = int(os.getenv("ADMIN_MAX_ATTEMPTS", "5"))
 ADMIN_LOCKOUT_SECS   = int(os.getenv("ADMIN_LOCKOUT_SECS", "300"))
 ADMIN_ATTEMPT_WINDOW = int(os.getenv("ADMIN_ATTEMPT_WINDOW", "60"))
 
 _admin_fail_log: dict[str, list[float]] = defaultdict(list)
-
-# Key format: NULL-TRACE-API-XXXXXXXX  (8 uppercase hex chars)
-KEY_FORMAT_REGEX = re.compile(r"^NULL-TRACE-API-[0-9A-F]{8}$")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -109,7 +73,7 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MongoDB clients
+# MongoDB
 # ─────────────────────────────────────────────────────────────────────────────
 
 _main_client:  MongoClient | None = None
@@ -123,7 +87,6 @@ def get_main_db():
         if not MONGO_URL:
             raise RuntimeError("MONGO_URL is not set.")
         _main_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
-        logger.info("✓ Main MongoDB client initialized")
     return _main_client[DB_NAME]
 
 
@@ -133,7 +96,6 @@ def get_email_db():
         if not MONGO_EMAIL_URL:
             raise RuntimeError("MONGO_EMAIL_URL is not set.")
         _email_client = MongoClient(MONGO_EMAIL_URL, serverSelectionTimeoutMS=5000)
-        logger.info("✓ Email MongoDB client initialized")
     return _email_client[DB_NAME]
 
 
@@ -143,14 +105,11 @@ def get_key_db():
         if not MONGO_KEY_URL:
             raise RuntimeError("MONGO_KEY_URL is not set.")
         _key_client = MongoClient(MONGO_KEY_URL, serverSelectionTimeoutMS=5000)
-        logger.info("✓ Key MongoDB client initialized")
     return _key_client[KEY_DB_NAME]
 
 
 def get_col(name: str) -> Collection:
-    if name == "email":
-        return get_email_db()[name]
-    return get_main_db()[name]
+    return get_email_db()[name] if name == "email" else get_main_db()[name]
 
 
 def get_keys_col() -> Collection:
@@ -160,51 +119,40 @@ def get_keys_col() -> Collection:
 @app.on_event("startup")
 async def startup():
     try:
-        db = get_main_db()
-        db.command("ping")
-        logger.info("✓ Main cluster connected — database: %s", DB_NAME)
+        db = get_main_db(); db.command("ping")
+        logger.info("✓ Main cluster connected — %s", DB_NAME)
         for c in ["address", "pan", "personal"]:
-            count = db[c].count_documents({})
-            logger.info("  %-10s : %s records", c, f"{count:,}")
+            logger.info("  %-10s : %s records", c, f"{db[c].count_documents({}):,}")
     except Exception as e:
-        logger.error("✗ Main cluster failed: %s", e)
+        logger.error("✗ Main cluster: %s", e)
 
     try:
-        db = get_email_db()
-        db.command("ping")
-        logger.info("✓ Email cluster connected — database: %s", DB_NAME)
-        count = db["email"].count_documents({})
-        logger.info("  %-10s : %s records", "email", f"{count:,}")
+        db = get_email_db(); db.command("ping")
+        logger.info("✓ Email cluster connected — email: %s records", f"{db['email'].count_documents({}):,}")
     except Exception as e:
-        logger.error("✗ Email cluster failed: %s", e)
+        logger.error("✗ Email cluster: %s", e)
 
     try:
-        db = get_key_db()
-        db.command("ping")
+        db  = get_key_db(); db.command("ping")
         col = db["keys"]
         col.create_index([("key", ASCENDING)], unique=True)
-        count = col.count_documents({})
-        logger.info("✓ Key cluster connected — %s keys stored", count)
+        logger.info("✓ Key cluster connected — %s keys stored", col.count_documents({}))
     except Exception as e:
-        logger.error("✗ Key cluster failed: %s", e)
+        logger.error("✗ Key cluster: %s", e)
 
     asyncio.create_task(_keep_alive())
-
-
-_keep_alive_task = None
 
 
 async def _keep_alive():
     own_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not own_url:
-        logger.info("⚠ RENDER_EXTERNAL_URL not set — keep-alive disabled")
         return
     await asyncio.sleep(60)
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
             try:
                 r = await client.get(f"{own_url}/health")
-                logger.info("♥ keep-alive ping → %s", r.status_code)
+                logger.info("♥ keep-alive → %s", r.status_code)
             except Exception as e:
                 logger.warning("♥ keep-alive failed: %s", e)
             await asyncio.sleep(240)
@@ -213,10 +161,8 @@ async def _keep_alive():
 @app.on_event("shutdown")
 async def shutdown():
     global _main_client, _email_client, _key_client
-    for client in [_main_client, _email_client, _key_client]:
-        if client:
-            client.close()
-    logger.info("MongoDB clients closed.")
+    for c in [_main_client, _email_client, _key_client]:
+        if c: c.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Key helpers
@@ -232,39 +178,21 @@ KEY_DURATIONS: dict[str, Optional[timedelta]] = {
 
 
 def generate_key() -> str:
-    """
-    Generate a key in the format: NULL-TRACE-API-XXXXXXXX
-    where XXXXXXXX is 8 random uppercase hex characters.
-    Example: NULL-TRACE-API-A3F9B21C
-    """
-    hash_part = uuid.uuid4().hex[:8].upper()
-    return f"NULL-TRACE-API-{hash_part}"
+    """Auto-generate: NULL-TRACE-API-XXXXXXXX (8 uppercase hex chars)."""
+    return f"NULL-TRACE-API-{uuid.uuid4().hex[:8].upper()}"
 
 
 def _unique_key(col: Collection) -> str:
-    """Keep regenerating until we get a value not already in the collection."""
     for _ in range(10):
-        candidate = generate_key()
-        if not col.find_one({"key": candidate}):
-            return candidate
-    # Astronomically unlikely to reach here, but be safe
-    return f"NULL-TRACE-API-{uuid.uuid4().hex[:8].upper()}"
+        k = generate_key()
+        if not col.find_one({"key": k}):
+            return k
+    return generate_key()          # virtually impossible to collide 10 times
 
 
 def compute_expiry(key_type: KeyType) -> Optional[str]:
     delta = KEY_DURATIONS[key_type]
-    if delta is None:
-        return None
-    return (datetime.now(timezone.utc) + delta).isoformat()
-
-
-def is_key_valid(doc: dict) -> bool:
-    if doc.get("revoked"):
-        return False
-    expiry = doc.get("expires_at")
-    if expiry is None:
-        return True
-    return datetime.now(timezone.utc) < datetime.fromisoformat(expiry)
+    return None if delta is None else (datetime.now(timezone.utc) + delta).isoformat()
 
 
 def resolve_key(raw_key: str) -> dict:
@@ -279,52 +207,32 @@ def resolve_key(raw_key: str) -> dict:
         raise HTTPException(status_code=401, detail="API key has expired.")
     col.update_one(
         {"key": raw_key},
-        {
-            "$inc": {"usage_count": 1},
-            "$set": {"last_used": datetime.now(timezone.utc).isoformat()},
-        },
+        {"$inc": {"usage_count": 1},
+         "$set": {"last_used": datetime.now(timezone.utc).isoformat()}},
     )
     return doc
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Security — Admin (brute-force protected)
+# Auth
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    fwd = request.headers.get("X-Forwarded-For")
+    return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown")
 
 
 def verify_admin(request: Request):
-    ip  = _get_ip(request)
-    now = time.time()
-
-    _admin_fail_log[ip] = [
-        t for t in _admin_fail_log[ip]
-        if now - t < ADMIN_LOCKOUT_SECS
-    ]
-
+    ip = _get_ip(request); now = time.time()
+    _admin_fail_log[ip] = [t for t in _admin_fail_log[ip] if now - t < ADMIN_LOCKOUT_SECS]
     recent = [t for t in _admin_fail_log[ip] if now - t < ADMIN_LOCKOUT_SECS]
     if len(recent) >= ADMIN_MAX_ATTEMPTS:
         wait = int(ADMIN_LOCKOUT_SECS - (now - recent[0]))
-        logger.warning("Admin brute-force lockout for IP %s (%ds remaining)", ip, wait)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many failed attempts. Try again in {wait} seconds.",
-        )
-
+        raise HTTPException(429, detail=f"Too many failed attempts. Try again in {wait}s.")
     key = request.headers.get("X-Admin-Key", "")
     if key != ADMIN_KEY:
         _admin_fail_log[ip].append(now)
-        attempts_left = ADMIN_MAX_ATTEMPTS - len(_admin_fail_log[ip])
-        logger.warning("Failed admin auth from IP %s (%d attempts left)", ip, attempts_left)
-        raise HTTPException(
-            status_code=401,
-            detail=f"Invalid admin key. {max(0, attempts_left)} attempt(s) remaining before lockout.",
-        )
-
+        left = ADMIN_MAX_ATTEMPTS - len(_admin_fail_log[ip])
+        raise HTTPException(401, detail=f"Invalid admin key. {max(0,left)} attempt(s) left before lockout.")
     _admin_fail_log[ip] = []
     return key
 
@@ -332,11 +240,11 @@ def verify_admin(request: Request):
 def verify_api_key(request: Request) -> dict:
     raw = request.headers.get("X-API-Key", "")
     if not raw:
-        raise HTTPException(status_code=401, detail="Missing X-API-Key header.")
+        raise HTTPException(401, detail="Missing X-API-Key header.")
     return resolve_key(raw)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Validation
+# Validation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 PHONE_REGEX = re.compile(r"^\d{10}(\d{2})?$")
@@ -346,172 +254,103 @@ EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 def validate_phone(value: str) -> str:
     cleaned = re.sub(r"[\s\-]", "", value.strip())
     if not PHONE_REGEX.fullmatch(cleaned):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"'{value}' is not a valid phone number. "
-                "Provide exactly 10 digits (e.g. 9711145004) "
-                "or 12 digits with country code (e.g. 919711145004)."
-            ),
-        )
+        raise HTTPException(422, detail=f"'{value}' is not a valid phone number.")
     return cleaned
 
 
 def validate_email(value: str) -> str:
     cleaned = value.strip()
     if not EMAIL_REGEX.fullmatch(cleaned):
-        raise HTTPException(
-            status_code=422,
-            detail=f"'{value}' is not a valid email. Expected: user@domain.com",
-        )
+        raise HTTPException(422, detail=f"'{value}' is not a valid email.")
     return cleaned.lower()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Field whitelists & serializers
+# Serializers
 # ─────────────────────────────────────────────────────────────────────────────
 
-ADDRESS_FIELDS  = {"name", "number", "email", "dob", "city", "address"}
-PAN_FIELDS      = {"name", "number", "email", "city", "pan"}
-EMAIL_FIELDS    = {"name", "number", "email", "city"}
-PERSONAL_FIELDS = {
-    "userId", "name", "fatherName", "cnic",
-    "mobile", "email", "address", "gender", "createdAt",
-}
+ADDRESS_FIELDS  = {"name","number","email","dob","city","address"}
+PAN_FIELDS      = {"name","number","email","city","pan"}
+EMAIL_FIELDS    = {"name","number","email","city"}
+PERSONAL_FIELDS = {"userId","name","fatherName","cnic","mobile","email","address","gender","createdAt"}
 
+def strip_id(d): d.pop("_id", None); return d
+def safe_address(docs):  return [{k:v for k,v in strip_id(d).items() if k in ADDRESS_FIELDS}  for d in docs]
+def safe_pan(docs):      return [{k:v for k,v in strip_id(d).items() if k in PAN_FIELDS}      for d in docs]
+def safe_email_docs(docs): return [{k:v for k,v in strip_id(d).items() if k in EMAIL_FIELDS}  for d in docs]
 
-def strip_id(doc: dict) -> dict:
-    doc.pop("_id", None)
-    return doc
-
-def safe_address(docs):
-    return [{k: v for k, v in strip_id(d).items() if k in ADDRESS_FIELDS} for d in docs]
-
-def safe_pan(docs):
-    return [{k: v for k, v in strip_id(d).items() if k in PAN_FIELDS} for d in docs]
-
-def safe_email_docs(docs):
-    return [{k: v for k, v in strip_id(d).items() if k in EMAIL_FIELDS} for d in docs]
-
-def build_image_url(filename) -> str | None:
-    if not filename:
-        return None
-    f = str(filename)
+def build_image_url(f):
+    if not f: return None
+    f = str(f)
     return f if f.startswith("http") else f"{IMAGE_BASE}/{f.lstrip('/')}"
 
 def safe_personal(docs):
-    results = []
+    out = []
     for d in docs:
         strip_id(d)
-        entry = {k: v for k, v in d.items() if k in PERSONAL_FIELDS}
-        entry["profileImageUrl"] = build_image_url(d.get("profileImage"))
-        entry["cnicImageUrl"]    = build_image_url(d.get("cnicImage"))
-        results.append(entry)
-    return results
+        e = {k:v for k,v in d.items() if k in PERSONAL_FIELDS}
+        e["profileImageUrl"] = build_image_url(d.get("profileImage"))
+        e["cnicImageUrl"]    = build_image_url(d.get("cnicImage"))
+        out.append(e)
+    return out
+
+def phone_filter(n, field="number"): return {field: {"$regex": f"{n[-10:]}$"}}
+def phone_filter_pak(n):             return {"mobile.digits": {"$regex": f"{n[-10:]}$"}}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Query helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def phone_filter(number: str, field: str = "number") -> dict:
-    short = number[-10:]
-    return {field: {"$regex": f"{short}$"}}
-
-def phone_filter_pak(number: str) -> dict:
-    short = number[-10:]
-    return {"mobile.digits": {"$regex": f"{short}$"}}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Search Endpoints
+# Search endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/search/number")
 @limiter.limit(RATE_LIMIT)
-async def search_by_number(
-    request: Request,
-    q: str = Query(..., min_length=10, max_length=12, description="10 or 12 digit phone number"),
-    _key_doc: dict = Depends(verify_api_key),
-):
-    number       = validate_phone(q)
-    filt         = phone_filter(number)
-    address_docs = list(get_col("address").find(filt, limit=MAX_RESULTS))
-    pan_docs     = list(get_col("pan").find(filt,     limit=MAX_RESULTS))
-    email_docs   = list(get_col("email").find(filt,   limit=MAX_RESULTS))
-
-    return {
-        "query": number,
-        "total": len(address_docs) + len(pan_docs) + len(email_docs),
-        "address": {"count": len(address_docs), "results": safe_address(address_docs)},
-        "pan":     {"count": len(pan_docs),     "results": safe_pan(pan_docs)},
-        "email":   {"count": len(email_docs),   "results": safe_email_docs(email_docs)},
-    }
+async def search_by_number(request: Request, q: str = Query(..., min_length=10, max_length=12), _k: dict = Depends(verify_api_key)):
+    n = validate_phone(q)
+    f = phone_filter(n)
+    return {"query": n, "total": 0,
+            "address": {"count": len(a := list(get_col("address").find(f, limit=MAX_RESULTS))), "results": safe_address(a)},
+            "pan":     {"count": len(p := list(get_col("pan").find(f,     limit=MAX_RESULTS))), "results": safe_pan(p)},
+            "email":   {"count": len(e := list(get_col("email").find(f,   limit=MAX_RESULTS))), "results": safe_email_docs(e)},
+            } | {"total": len(a)+len(p)+len(e)}
 
 
 @app.get("/search/email")
 @limiter.limit(RATE_LIMIT)
-async def search_by_email(
-    request: Request,
-    q: str = Query(..., min_length=6, max_length=254, description="Valid email address"),
-    _key_doc: dict = Depends(verify_api_key),
-):
-    email        = validate_email(q)
-    filt         = {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
-    address_docs = list(get_col("address").find(filt, limit=MAX_RESULTS))
-    pan_docs     = list(get_col("pan").find(filt,     limit=MAX_RESULTS))
-    email_docs   = list(get_col("email").find(filt,   limit=MAX_RESULTS))
-
-    return {
-        "query": email,
-        "total": len(address_docs) + len(pan_docs) + len(email_docs),
-        "address": {"count": len(address_docs), "results": safe_address(address_docs)},
-        "pan":     {"count": len(pan_docs),     "results": safe_pan(pan_docs)},
-        "email":   {"count": len(email_docs),   "results": safe_email_docs(email_docs)},
-    }
+async def search_by_email(request: Request, q: str = Query(..., min_length=6, max_length=254), _k: dict = Depends(verify_api_key)):
+    em = validate_email(q)
+    f  = {"email": {"$regex": f"^{re.escape(em)}$", "$options": "i"}}
+    return {"query": em,
+            "address": {"count": len(a := list(get_col("address").find(f, limit=MAX_RESULTS))), "results": safe_address(a)},
+            "pan":     {"count": len(p := list(get_col("pan").find(f,     limit=MAX_RESULTS))), "results": safe_pan(p)},
+            "email":   {"count": len(e := list(get_col("email").find(f,   limit=MAX_RESULTS))), "results": safe_email_docs(e)},
+            "total":   len(a)+len(p)+len(e)}
 
 
 @app.get("/search/pak/number")
 @limiter.limit(RATE_LIMIT)
-async def search_pak_by_number(
-    request: Request,
-    q: str = Query(..., min_length=10, max_length=12, description="10 or 12 digit Pakistani mobile"),
-    _key_doc: dict = Depends(verify_api_key),
-):
-    number = validate_phone(q)
-    filt   = phone_filter_pak(number)
-    docs   = list(get_col("personal").find(filt, limit=MAX_RESULTS))
-
-    return {
-        "query":   number,
-        "count":   len(docs),
-        "results": safe_personal(docs),
-    }
+async def search_pak_by_number(request: Request, q: str = Query(..., min_length=10, max_length=12), _k: dict = Depends(verify_api_key)):
+    n    = validate_phone(q)
+    docs = list(get_col("personal").find(phone_filter_pak(n), limit=MAX_RESULTS))
+    return {"query": n, "count": len(docs), "results": safe_personal(docs)}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Key Info Endpoint
+# Key info (user endpoint)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/key/info")
 async def key_info(request: Request, key_doc: dict = Depends(verify_api_key)):
     expiry = key_doc.get("expires_at")
     now    = datetime.now(timezone.utc)
-
     if expiry:
-        exp_dt      = datetime.fromisoformat(expiry)
-        days_left   = max(0, (exp_dt - now).days)
-        expires_str = exp_dt.strftime("%Y-%m-%d %H:%M UTC")
+        exp_dt = datetime.fromisoformat(expiry)
+        days_left, expires_str = max(0,(exp_dt-now).days), exp_dt.strftime("%Y-%m-%d %H:%M UTC")
     else:
-        days_left   = None
-        expires_str = "Never (lifetime)"
-
+        days_left, expires_str = None, "Never (lifetime)"
     return {
-        "key":         key_doc["key"],
-        "type":        key_doc.get("type", "unknown"),
-        "label":       key_doc.get("label", ""),
-        "active":      True,
-        "expires_at":  expires_str,
-        "days_left":   days_left,
-        "usage_count": key_doc.get("usage_count", 0),
-        "last_used":   key_doc.get("last_used", "never"),
-        "created_at":  key_doc.get("created_at", ""),
+        "key": key_doc["key"], "type": key_doc.get("type","unknown"),
+        "label": key_doc.get("label",""), "active": True,
+        "expires_at": expires_str, "days_left": days_left,
+        "usage_count": key_doc.get("usage_count",0),
+        "last_used": key_doc.get("last_used","never"),
+        "created_at": key_doc.get("created_at",""),
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,64 +358,51 @@ async def key_info(request: Request, key_doc: dict = Depends(verify_api_key)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GenerateKeyRequest(BaseModel):
-    type:  KeyType = Field(..., description="monthly | yearly | lifetime")
-    count: int     = Field(1, ge=1, le=100, description="How many keys to generate")
-    label: str     = Field("", description="Optional label/note for this batch")
+    type:  KeyType = Field(...)
+    count: int     = Field(1, ge=1, le=100)
+    label: str     = Field("")
 
 
 class UpdateLabelRequest(BaseModel):
-    label: str = Field("", max_length=120, description="New label (empty string clears it)")
+    label: str = Field("", max_length=120)
 
 
 class UpdateKeyValueRequest(BaseModel):
-    new_key: str = Field(..., description="New key in NULL-TRACE-API-XXXXXXXX format")
+    """
+    Free-text rename — admin can set any string they like.
+    Rules:
+      - 1–120 characters
+      - No leading/trailing whitespace
+      - No newlines or tab characters
+    """
+    new_key: str = Field(..., min_length=1, max_length=120)
 
     @field_validator("new_key")
     @classmethod
-    def validate_format(cls, v: str) -> str:
-        v = v.strip().upper()
-        if not KEY_FORMAT_REGEX.fullmatch(v):
-            raise ValueError(
-                "Key must match NULL-TRACE-API-XXXXXXXX "
-                "(8 uppercase hex chars, e.g. NULL-TRACE-API-A3F9B21C)"
-            )
+    def clean(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("new_key cannot be blank.")
+        if any(c in v for c in "\n\r\t"):
+            raise ValueError("new_key must not contain newline or tab characters.")
         return v
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Admin — Key Management
+# Admin — key management
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/admin/keys/generate")
 @limiter.limit("10/minute")
-async def admin_generate_keys(
-    request: Request,
-    body: GenerateKeyRequest,
-    _admin: str = Depends(verify_admin),
-):
-    """
-    Generate one or more keys in NULL-TRACE-API-XXXXXXXX format.
-    Requires X-Admin-Key header.
-    """
+async def admin_generate_keys(request: Request, body: GenerateKeyRequest, _admin: str = Depends(verify_admin)):
     col  = get_keys_col()
     now  = datetime.now(timezone.utc).isoformat()
     keys = []
-
     for _ in range(body.count):
-        new_key = _unique_key(col)
-        doc = {
-            "key":         new_key,
-            "type":        body.type,
-            "label":       body.label,
-            "expires_at":  compute_expiry(body.type),
-            "revoked":     False,
-            "usage_count": 0,
-            "last_used":   None,
-            "created_at":  now,
-        }
-        col.insert_one(doc)
-        doc.pop("_id", None)
-        keys.append(doc)
-
+        k = _unique_key(col)
+        doc = {"key": k, "type": body.type, "label": body.label,
+               "expires_at": compute_expiry(body.type), "revoked": False,
+               "usage_count": 0, "last_used": None, "created_at": now}
+        col.insert_one(doc); doc.pop("_id", None); keys.append(doc)
     return {"generated": len(keys), "type": body.type, "keys": keys}
 
 
@@ -584,183 +410,114 @@ async def admin_generate_keys(
 @limiter.limit("10/minute")
 async def admin_list_keys(
     request: Request,
-    page:     int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=200),
-    type:     Optional[str]  = Query(None),
-    revoked:  Optional[bool] = Query(None),
-    _admin:   str = Depends(verify_admin),
+    page: int = Query(1, ge=1), per_page: int = Query(50, ge=1, le=200),
+    type: Optional[str] = Query(None), revoked: Optional[bool] = Query(None),
+    _admin: str = Depends(verify_admin),
 ):
     col   = get_keys_col()
-    filt: dict = {}
-    if type:
-        filt["type"] = type
-    if revoked is not None:
-        filt["revoked"] = revoked
-
-    total  = col.count_documents(filt)
-    skip   = (page - 1) * per_page
-    cursor = col.find(filt).sort("created_at", -1).skip(skip).limit(per_page)
-
-    keys = []
-    now  = datetime.now(timezone.utc)
-    for doc in cursor:
+    filt  = {**({"type": type} if type else {}), **({"revoked": revoked} if revoked is not None else {})}
+    total = col.count_documents(filt)
+    keys  = []
+    now   = datetime.now(timezone.utc)
+    for doc in col.find(filt).sort("created_at", -1).skip((page-1)*per_page).limit(per_page):
         doc.pop("_id", None)
         expiry = doc.get("expires_at")
         if expiry:
-            exp_dt           = datetime.fromisoformat(expiry)
+            exp_dt = datetime.fromisoformat(expiry)
             doc["status"]    = "expired" if now >= exp_dt else "active"
-            doc["days_left"] = max(0, (exp_dt - now).days)
+            doc["days_left"] = max(0, (exp_dt-now).days)
         else:
             doc["status"]    = "revoked" if doc.get("revoked") else "lifetime"
             doc["days_left"] = None
         keys.append(doc)
-
-    return {
-        "total": total, "page": page,
-        "per_page": per_page,
-        "pages": (total + per_page - 1) // per_page,
-        "keys": keys,
-    }
+    return {"total": total, "page": page, "per_page": per_page,
+            "pages": (total+per_page-1)//per_page, "keys": keys}
 
 
 @app.delete("/admin/keys/{key_value}")
 @limiter.limit("10/minute")
-async def admin_revoke_key(
-    request: Request, key_value: str, _admin: str = Depends(verify_admin),
-):
-    col    = get_keys_col()
-    result = col.update_one(
-        {"key": key_value},
-        {"$set": {"revoked": True, "revoked_at": datetime.now(timezone.utc).isoformat()}},
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+async def admin_revoke_key(request: Request, key_value: str, _admin: str = Depends(verify_admin)):
+    col = get_keys_col()
+    r   = col.update_one({"key": key_value}, {"$set": {"revoked": True, "revoked_at": datetime.now(timezone.utc).isoformat()}})
+    if r.matched_count == 0: raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     return {"revoked": True, "key": key_value}
 
 
 @app.delete("/admin/keys/{key_value}/hard")
 @limiter.limit("10/minute")
-async def admin_delete_key(
-    request: Request, key_value: str, _admin: str = Depends(verify_admin),
-):
-    col    = get_keys_col()
-    result = col.delete_one({"key": key_value})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+async def admin_delete_key(request: Request, key_value: str, _admin: str = Depends(verify_admin)):
+    col = get_keys_col()
+    r   = col.delete_one({"key": key_value})
+    if r.deleted_count == 0: raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     return {"deleted": True, "key": key_value}
 
 
 @app.post("/admin/keys/{key_value}/unrevoke")
 @limiter.limit("10/minute")
-async def admin_unrevoke_key(
-    request: Request, key_value: str, _admin: str = Depends(verify_admin),
-):
-    col    = get_keys_col()
-    result = col.update_one(
-        {"key": key_value},
-        {"$set": {"revoked": False}, "$unset": {"revoked_at": ""}},
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+async def admin_unrevoke_key(request: Request, key_value: str, _admin: str = Depends(verify_admin)):
+    col = get_keys_col()
+    r   = col.update_one({"key": key_value}, {"$set": {"revoked": False}, "$unset": {"revoked_at": ""}})
+    if r.matched_count == 0: raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     return {"unrevoked": True, "key": key_value}
 
 
 @app.patch("/admin/keys/{key_value}/label")
 @limiter.limit("20/minute")
-async def admin_update_label(
-    request: Request, key_value: str,
-    body: UpdateLabelRequest, _admin: str = Depends(verify_admin),
-):
-    """Update or clear the label/note on a key."""
-    col    = get_keys_col()
-    result = col.update_one(
-        {"key": key_value},
-        {"$set": {"label": body.label, "label_updated_at": datetime.now(timezone.utc).isoformat()}},
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+async def admin_update_label(request: Request, key_value: str, body: UpdateLabelRequest, _admin: str = Depends(verify_admin)):
+    col = get_keys_col()
+    r   = col.update_one({"key": key_value}, {"$set": {"label": body.label, "label_updated_at": datetime.now(timezone.utc).isoformat()}})
+    if r.matched_count == 0: raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     logger.info("Label updated: %s → '%s'", key_value, body.label)
     return {"updated": True, "key": key_value, "label": body.label}
 
 
 @app.patch("/admin/keys/{key_value}/value")
 @limiter.limit("20/minute")
-async def admin_update_key_value(
-    request:   Request,
-    key_value: str,
-    body:      UpdateKeyValueRequest,
-    _admin:    str = Depends(verify_admin),
-):
+async def admin_update_key_value(request: Request, key_value: str, body: UpdateKeyValueRequest, _admin: str = Depends(verify_admin)):
     """
-    Replace the key string itself with a new NULL-TRACE-API-XXXXXXXX value.
-
-    - The old key immediately stops working.
-    - All metadata (type, expiry, label, usage count, etc.) is preserved.
-    - Returns 404 if the old key doesn't exist.
-    - Returns 409 if the new key value is already taken.
-
-    Body: { "new_key": "NULL-TRACE-API-A3F9B21C" }
+    Rename a key to any string the admin chooses (no format restriction).
+    - Old key immediately stops working; new key string inherits all metadata.
+    - 404 if old key not found.
+    - 409 if new key string is already taken by another document.
     """
     col = get_keys_col()
-
-    # Confirm the key being edited exists
     if not col.find_one({"key": key_value}):
-        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
-
-    # Confirm the new value isn't already used by a different document
+        raise HTTPException(404, detail=f"Key '{key_value}' not found.")
     if body.new_key != key_value and col.find_one({"key": body.new_key}):
-        raise HTTPException(
-            status_code=409,
-            detail=f"'{body.new_key}' is already in use. Choose a different value.",
-        )
-
-    col.update_one(
-        {"key": key_value},
-        {"$set": {
-            "key":            body.new_key,
-            "key_updated_at": datetime.now(timezone.utc).isoformat(),
-        }},
-    )
-
-    logger.info("Key value changed: %s → %s", key_value, body.new_key)
+        raise HTTPException(409, detail=f"'{body.new_key}' is already in use.")
+    col.update_one({"key": key_value}, {"$set": {"key": body.new_key, "key_updated_at": datetime.now(timezone.utc).isoformat()}})
+    logger.info("Key renamed: %s → %s", key_value, body.new_key)
     return {"updated": True, "old_key": key_value, "new_key": body.new_key}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Visitor Counter
+# Visitor counter
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/visit")
 async def record_visit(request: Request):
     try:
-        visits = get_main_db()["visits"]
-        visits.update_one(
-            {"_id": "global_counter"},
-            {"$inc": {"total": 1}, "$set": {"last_visit": datetime.now(timezone.utc).isoformat()}},
-            upsert=True,
-        )
-        doc = visits.find_one({"_id": "global_counter"})
-        return {"total": doc["total"] if doc else 1}
+        v = get_main_db()["visits"]
+        v.update_one({"_id":"global_counter"}, {"$inc":{"total":1},"$set":{"last_visit":datetime.now(timezone.utc).isoformat()}}, upsert=True)
+        d = v.find_one({"_id":"global_counter"})
+        return {"total": d["total"] if d else 1}
     except Exception as e:
-        logger.error("Visit counter error: %s", e)
-        return {"total": 0}
+        logger.error("Visit counter: %s", e); return {"total": 0}
 
 
 @app.get("/visit")
 async def get_visits():
     try:
-        doc = get_main_db()["visits"].find_one({"_id": "global_counter"})
-        return {"total": doc["total"] if doc else 0}
+        d = get_main_db()["visits"].find_one({"_id":"global_counter"})
+        return {"total": d["total"] if d else 0}
     except Exception as e:
-        logger.error("Get visits error: %s", e)
-        return {"total": 0}
+        logger.error("Get visits: %s", e); return {"total": 0}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Health Check
+# Health
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.head("/health")
-async def health_head():
-    return JSONResponse(content=None, status_code=200)
+async def health_head(): return JSONResponse(content=None, status_code=200)
 
 
 @app.get("/health")
@@ -769,21 +526,21 @@ async def health():
         main_db  = get_main_db()
         email_db = get_email_db()
         key_db   = get_key_db()
-        visits   = main_db["visits"].find_one({"_id": "global_counter"})
-        key_col  = key_db["keys"]
+        visits   = main_db["visits"].find_one({"_id":"global_counter"})
+        kc       = key_db["keys"]
         return {
             "status": "ok",
-            "main_cluster": {c: main_db[c].count_documents({}) for c in ["address", "pan", "personal"]},
+            "main_cluster":  {c: main_db[c].count_documents({}) for c in ["address","pan","personal"]},
             "email_cluster": {"email": email_db["email"].count_documents({})},
             "key_system": {
-                "total_keys":    key_col.count_documents({}),
-                "active_keys":   key_col.count_documents({"revoked": False}),
-                "revoked_keys":  key_col.count_documents({"revoked": True}),
-                "monthly_keys":  key_col.count_documents({"type": "monthly"}),
-                "yearly_keys":   key_col.count_documents({"type": "yearly"}),
-                "lifetime_keys": key_col.count_documents({"type": "lifetime"}),
+                "total_keys":    kc.count_documents({}),
+                "active_keys":   kc.count_documents({"revoked":False}),
+                "revoked_keys":  kc.count_documents({"revoked":True}),
+                "monthly_keys":  kc.count_documents({"type":"monthly"}),
+                "yearly_keys":   kc.count_documents({"type":"yearly"}),
+                "lifetime_keys": kc.count_documents({"type":"lifetime"}),
             },
             "visitors": visits["total"] if visits else 0,
         }
     except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        return {"status":"error","detail":str(e)}
