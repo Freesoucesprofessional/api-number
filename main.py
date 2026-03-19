@@ -21,9 +21,12 @@ Endpoints:
   GET  /health                      — full status with collection counts
 
   [Admin — requires X-Admin-Key header]
-  POST /admin/keys/generate         — generate one or more keys
-  GET  /admin/keys                  — list all keys (paginated)
-  DELETE /admin/keys/{key}          — revoke/delete a key
+  POST  /admin/keys/generate              — generate one or more keys
+  GET   /admin/keys                       — list all keys (paginated)
+  DELETE /admin/keys/{key}               — revoke/delete a key
+  DELETE /admin/keys/{key}/hard          — permanently delete a key
+  POST  /admin/keys/{key}/unrevoke       — restore a revoked key
+  PATCH /admin/keys/{key}/label          — update label/note on a key  ← NEW
 
   [User — requires X-API-Key header (the license key itself)]
   GET  /key/info                    — check key status, expiry, usage
@@ -99,7 +102,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "DELETE", "HEAD", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "HEAD", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     allow_credentials=False,
 )
@@ -419,7 +422,7 @@ def phone_filter_pak(number: str) -> dict:
     return {"mobile.digits": {"$regex": f"{short}$"}}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Search Endpoints  (now use license key, not static API_KEYS env var)
+# Search Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/search/number")
@@ -521,6 +524,10 @@ class GenerateKeyRequest(BaseModel):
     type:  KeyType = Field(..., description="monthly | yearly | lifetime")
     count: int     = Field(1, ge=1, le=100, description="How many keys to generate")
     label: str     = Field("", description="Optional label/note for this batch")
+
+
+class UpdateLabelRequest(BaseModel):
+    label: str = Field("", max_length=120, description="New label/note (empty string clears it)")
 
 
 @app.post("/admin/keys/generate")
@@ -671,6 +678,44 @@ async def admin_unrevoke_key(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
     return {"unrevoked": True, "key": key_value}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW: Update label on any key (revoked or active)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.patch("/admin/keys/{key_value}/label")
+@limiter.limit("20/minute")
+async def admin_update_label(
+    request:   Request,
+    key_value: str,
+    body:      UpdateLabelRequest,
+    _admin:    str = Depends(verify_admin),
+):
+    """
+    Update (or clear) the label/note on a key.
+    Works on both active and revoked keys.
+    Requires X-Admin-Key header.
+
+    Body:
+      { "label": "new note here" }   — set a new label
+      { "label": "" }                — clear the label
+    """
+    col    = get_keys_col()
+    result = col.update_one(
+        {"key": key_value},
+        {
+            "$set": {
+                "label":      body.label,
+                "label_updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail=f"Key '{key_value}' not found.")
+
+    logger.info("Label updated for key %s → '%s'", key_value, body.label)
+    return {"updated": True, "key": key_value, "label": body.label}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Visitor Counter
